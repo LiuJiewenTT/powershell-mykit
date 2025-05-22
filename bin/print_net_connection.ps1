@@ -1,0 +1,1 @@
+﻿Get-NetTCPConnection | Format-Table -Property LocalAddress, LocalPort, RemoteAddress, RemotePort, State, @{Name="ProcessName";Expression={(Get-Process -Id $_.OwningProcess).Name}} -AutoSize 

@@ -1,7 +1,21 @@
-$mykit_dir = "G:\TT.OS.ToolKit\Windows\powershell-mykit\bin\"
+ï»¿$mykit_dir = "G:\TT.OS.ToolKit\Windows\powershell-mykit\bin\"
 Write-Host "`$mykit_dir=${mykit_dir}"
-. (Join-Path -Path $mykit_dir -ChildPath "TT.LoadScript.utils.ps1")
 # . "${mykit_dir}load_powershell_mykit.bat"
+$env:PATH += ";$mykit_dir"
+
+try {
+    $currentCP = (chcp | Out-String) -replace "[^\d]",""
+    if ($currentCP -ne "65001") {
+        Write-Host "[LOG]: Active code page is not 65001(UTF-8). [$currentCP]"
+        chcp 65001 | Out-Null
+    }
+} catch {
+    Write-Warning "Failed to check/set code page: $_"
+}
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+. "TT.LoadScript.utils.ps1"
 
 
 function profile_home {
@@ -22,7 +36,7 @@ function ishome {
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
-    # Load-ScriptFunctions $filepath
+    # Import-ScriptFunctions $filepath
     . $filepath
 
     Home-NetInit
@@ -34,7 +48,7 @@ function isnormal {
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
-    # Load-ScriptFunctions $filepath
+    # Import-ScriptFunctions $filepath
     . $filepath
 
     Normal-NetInit
@@ -46,28 +60,28 @@ function iswork {
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
-    Load-ScriptFunctions $filepath
+    Import-ScriptFunctions $filepath
     # . $filepath
 
     CTFF-NetInit
 }
 
 
-# @description »ñÈ¡µÚÒ»¸öÆ¥ÅäµÄÍøÂçÊÊÅäÆ÷ Id
+# @description è·å–ç¬¬ä¸€ä¸ªåŒ¹é…çš„ç½‘ç»œé€‚é…å™¨ Id
 # @param[input] 
-# @param[output] $global:adapterId Æ¥Åäµ½µÄÍøÂçÊÊÅäÆ÷ Id
+# @param[output] $global:adapterId åŒ¹é…åˆ°çš„ç½‘ç»œé€‚é…å™¨ Id
 function getIfAdapterIdExist {
-    # »ñÈ¡ËùÓĞÍøÂçÊÊÅäÆ÷µÄ ID ÁĞ±í
+    # è·å–æ‰€æœ‰ç½‘ç»œé€‚é…å™¨çš„ ID åˆ—è¡¨
     $adapterList = Get-NetAdapter | Select-Object -ExpandProperty ifIndex
     $targetAdapterId_cnt = 2
-    $targetAdapterId_1 = 6   # ÒÔÌ«Íø
-    $targetAdapterId_2 = 18  # ÒÔÌ«Íø 2
-    # Ê¹ÓÃ for Ñ­»·´Ó 1 ±éÀúµ½ cnt
+    $targetAdapterId_1 = 6   # ä»¥å¤ªç½‘
+    $targetAdapterId_2 = 18  # ä»¥å¤ªç½‘ 2
+    # ä½¿ç”¨ for å¾ªç¯ä» 1 éå†åˆ° cnt
     for ($i = 1; $i -le $targetAdapterId_cnt; $i++) {
         ${targetAdapterId_i} = (Get-Variable -Name "targetAdapterId_${i}").Value
-        Write-Host "³¢ÊÔÆ¥ÅäµÚ${i}¸öÍøÂçÊÊÅäÆ÷, Id=${targetAdapterId_i}"
+        Write-Host "å°è¯•åŒ¹é…ç¬¬${i}ä¸ªç½‘ç»œé€‚é…å™¨, Id=${targetAdapterId_i}"
         if ($adapterList -contains ${targetAdapterId_i}) {
-            Write-Host "ÕÒµ½µÄÍøÂçÊÊÅäÆ÷IdÊÇ£º${targetAdapterId_i}"
+            Write-Host "æ‰¾åˆ°çš„ç½‘ç»œé€‚é…å™¨Idæ˜¯ï¼š${targetAdapterId_i}"
             $global:adapterId = ${targetAdapterId_i}
             break
         }
