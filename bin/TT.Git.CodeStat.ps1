@@ -168,7 +168,7 @@ function __GitCodeStat_ValidateParams {
 }
 
 
-# 打印区块分隔标题
+# 打印区块分隔标题（两端固定 16 个 =，中间标题自然嵌入）
 function __GitCodeStat_WriteHeader {
     param([string]$Title, [System.ConsoleColor]$Color = 'White')
     Write-Host ""
@@ -177,20 +177,28 @@ function __GitCodeStat_WriteHeader {
 }
 
 
-# 打印单项统计（字符+字节全量，7 行）
-# 通过 Write-Host 输出，不进入管道
+# 打印单项统计（字符+字节全量，带子 section 标题）
+# 标签间距硬编码，无需动态计算显示宽度
+# 标签显示宽度: "新增代码总字符"=12, "删除代码总字符"=12, "变更合计字符数"=12,
+#               "新增代码UTF8总字节"=17, "删除代码UTF8总字节"=17, "变更合计字节"=10
+# 目标显示宽度 17，按差值补空格
 function __GitCodeStat_WriteFull {
     param([PSCustomObject]$Stat)
 
-    Write-Host "  新增代码总字符:       $($Stat.Add_Char)"
-    Write-Host "  删除代码总字符:       $($Stat.Del_Char)"
-    Write-Host "  变更合计字符数:       $($Stat.Total_Char)"
+    $fmt = '{0,12:N0}'
+
+    Write-Host "  --- 字符数统计 ---" -ForegroundColor Gray
+    Write-Host "  新增代码总字符     $($fmt -f $Stat.Add_Char)"
+    Write-Host "  删除代码总字符     $($fmt -f $Stat.Del_Char)"
+    Write-Host "  变更合计字符数     $($fmt -f $Stat.Total_Char)"
     Write-Host ""
-    Write-Host "  新增代码UTF8总字节:   $($Stat.Add_Bytes)"
-    Write-Host "  删除代码UTF8总字节:   $($Stat.Del_Bytes)"
-    Write-Host "  变更合计字节:         $($Stat.Total_Bytes)"
+    Write-Host "  --- UTF-8字节统计 ---" -ForegroundColor Gray
+    Write-Host "  新增代码UTF8总字节 $($fmt -f $Stat.Add_Bytes)"
+    Write-Host "  删除代码UTF8总字节 $($fmt -f $Stat.Del_Bytes)"
+    Write-Host "  变更合计字节       $($fmt -f $Stat.Total_Bytes)"
     Write-Host ""
-    Write-Host "  仅新增代码UTF8总字节: $($Stat.Add_Bytes)"
+    Write-Host "  --- 仅新增代码字节统计 ---" -ForegroundColor Gray
+    Write-Host "  新增代码UTF8总字节 $($fmt -f $Stat.Add_Bytes)"
 }
 
 
