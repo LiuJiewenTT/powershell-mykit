@@ -14,6 +14,7 @@
       -Staged       → 仅统计暂存区
       -Commit1 xxx  → 统计 xxx 到 HEAD 之间变更
       -Commit1 xxx -Commit2 yyy → 统计 xxx 到 yyy 之间变更
+      -PassThru     → 返回原始统计对象（供编程使用），否则仅展示不返回
 
     边界处理:
       - 首次提交（无 HEAD^）自动切换 --root 模式
@@ -96,7 +97,6 @@ function __GitCodeStat_GetDiff {
     if ($Staged) {
         $result = git diff --cached
         if ($LASTEXITCODE -ne 0) { return @() }
-        # git diff --cached 无暂存内容时返回 $null，统一转空数组
         if ($null -eq $result -or $result.Count -eq 0) { return @() }
         return @($result)
     }
@@ -124,14 +124,12 @@ function __GitCodeStat_GetDiff {
     }
 
     # --- 无参数默认: HEAD^..HEAD，兼容首次提交 ---
-    # 先检查仓库是否有任何提交
     $null = git rev-parse --verify HEAD 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "仓库没有任何提交，无法统计" -ForegroundColor Yellow
         return @()
     }
 
-    # 检查是否存在父提交
     $null = git rev-parse --verify HEAD^ 2>$null
     if ($LASTEXITCODE -eq 0) {
         $result = git diff HEAD^ HEAD
@@ -179,6 +177,23 @@ function __GitCodeStat_WriteHeader {
 }
 
 
+# 打印单项统计（字符+字节全量，7 行）
+# 通过 Write-Host 输出，不进入管道
+function __GitCodeStat_WriteFull {
+    param([PSCustomObject]$Stat)
+
+    Write-Host "  新增代码总字符:       $($Stat.Add_Char)"
+    Write-Host "  删除代码总字符:       $($Stat.Del_Char)"
+    Write-Host "  变更合计字符数:       $($Stat.Total_Char)"
+    Write-Host ""
+    Write-Host "  新增代码UTF8总字节:   $($Stat.Add_Bytes)"
+    Write-Host "  删除代码UTF8总字节:   $($Stat.Del_Bytes)"
+    Write-Host "  变更合计字节:         $($Stat.Total_Bytes)"
+    Write-Host ""
+    Write-Host "  仅新增代码UTF8总字节: $($Stat.Add_Bytes)"
+}
+
+
 # ============================================================
 # 方案1: 统计代码字符数（新增 / 删除 / 合计）
 # ============================================================
@@ -193,11 +208,13 @@ function Get-GitCodeCharStat {
         -Staged  → 仅统计暂存区
         -Commit1 xxx → xxx..HEAD
         -Commit1 xxx -Commit2 yyy → xxx..yyy
+        -PassThru → 返回原始统计对象（供编程使用）
     .EXAMPLE
         Get-GitCodeCharStat
         Get-GitCodeCharStat -Staged
         Get-GitCodeCharStat HEAD~3
         Get-GitCodeCharStat v1.0 v2.0
+        $s = Get-GitCodeCharStat -PassThru
     #>
     [CmdletBinding()]
     param(
@@ -205,7 +222,8 @@ function Get-GitCodeCharStat {
         [string]$Commit1,
         [Parameter(Position = 1)]
         [string]$Commit2,
-        [switch]$Staged
+        [switch]$Staged,
+        [switch]$PassThru
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
@@ -218,7 +236,7 @@ function Get-GitCodeCharStat {
     Write-Host "删除代码总字符: $($stat.Del_Char)"
     Write-Host "变更合计字符数: $($stat.Total_Char)"
 
-    return $stat
+    if ($PassThru) { return $stat }
 }
 
 
@@ -239,6 +257,7 @@ function Get-GitCodeByteStat {
         Get-GitCodeByteStat -Staged
         Get-GitCodeByteStat HEAD~3
         Get-GitCodeByteStat v1.0 v2.0
+        $s = Get-GitCodeByteStat -PassThru
     #>
     [CmdletBinding()]
     param(
@@ -246,7 +265,8 @@ function Get-GitCodeByteStat {
         [string]$Commit1,
         [Parameter(Position = 1)]
         [string]$Commit2,
-        [switch]$Staged
+        [switch]$Staged,
+        [switch]$PassThru
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
@@ -259,7 +279,7 @@ function Get-GitCodeByteStat {
     Write-Host "删除代码UTF8总字节: $($stat.Del_Bytes)"
     Write-Host "变更合计字节:       $($stat.Total_Bytes)"
 
-    return $stat
+    if ($PassThru) { return $stat }
 }
 
 
@@ -280,6 +300,7 @@ function Get-GitCodeNewByteStat {
         Get-GitCodeNewByteStat -Staged
         Get-GitCodeNewByteStat HEAD~3
         Get-GitCodeNewByteStat v1.0 v2.0
+        $s = Get-GitCodeNewByteStat -PassThru
     #>
     [CmdletBinding()]
     param(
@@ -287,7 +308,8 @@ function Get-GitCodeNewByteStat {
         [string]$Commit1,
         [Parameter(Position = 1)]
         [string]$Commit2,
-        [switch]$Staged
+        [switch]$Staged,
+        [switch]$PassThru
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
@@ -298,7 +320,7 @@ function Get-GitCodeNewByteStat {
 
     Write-Host "新增代码UTF8总字节: $($stat.Add_Bytes)"
 
-    return $stat
+    if ($PassThru) { return $stat }
 }
 
 
@@ -316,14 +338,13 @@ function Get-GitCodeStat {
         -Staged       → 仅暂存区（三种方案）
         -Commit1 xxx  → xxx..HEAD（三种方案）
         -Commit1 xxx -Commit2 yyy → xxx..yyy（三种方案）
+        -PassThru     → 返回原始统计对象（供编程使用）
     .EXAMPLE
         Get-GitCodeStat
         Get-GitCodeStat -Staged
         Get-GitCodeStat HEAD~3
         Get-GitCodeStat v1.0 v2.0
-    .OUTPUTS
-        无参数时返回含 Staged 和 Head 两个属性的哈希表;
-        其他模式返回统计对象。
+        $r = Get-GitCodeStat -PassThru
     #>
     [CmdletBinding()]
     param(
@@ -331,7 +352,8 @@ function Get-GitCodeStat {
         [string]$Commit1,
         [Parameter(Position = 1)]
         [string]$Commit2,
-        [switch]$Staged
+        [switch]$Staged,
+        [switch]$PassThru
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
@@ -342,70 +364,37 @@ function Get-GitCodeStat {
 
         # -- 暂存区统计 --
         __GitCodeStat_WriteHeader -Title "暂存区变更统计" -Color Cyan
-
         $diffLines = __GitCodeStat_GetDiff -Staged
         $stagedStat = __GitCodeStat_Compute -DiffLines $diffLines
-
-        Write-Host "--- 字符数统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码总字符:   $($stagedStat.Add_Char)"
-        Write-Host "  删除代码总字符:   $($stagedStat.Del_Char)"
-        Write-Host "  变更合计字符数:   $($stagedStat.Total_Char)"
-        Write-Host ""
-        Write-Host "--- UTF-8字节统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码UTF8总字节: $($stagedStat.Add_Bytes)"
-        Write-Host "  删除代码UTF8总字节: $($stagedStat.Del_Bytes)"
-        Write-Host "  变更合计字节:       $($stagedStat.Total_Bytes)"
-        Write-Host ""
-        Write-Host "--- 仅新增代码字节统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码UTF8总字节: $($stagedStat.Add_Bytes)"
+        __GitCodeStat_WriteFull -Stat $stagedStat
 
         # -- 最新提交统计 --
         __GitCodeStat_WriteHeader -Title "最新提交 HEAD 变更统计" -Color Green
-
         $diffLines = __GitCodeStat_GetDiff
         $headStat = __GitCodeStat_Compute -DiffLines $diffLines
+        __GitCodeStat_WriteFull -Stat $headStat
 
-        Write-Host "--- 字符数统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码总字符:   $($headStat.Add_Char)"
-        Write-Host "  删除代码总字符:   $($headStat.Del_Char)"
-        Write-Host "  变更合计字符数:   $($headStat.Total_Char)"
-        Write-Host ""
-        Write-Host "--- UTF-8字节统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码UTF8总字节: $($headStat.Add_Bytes)"
-        Write-Host "  删除代码UTF8总字节: $($headStat.Del_Bytes)"
-        Write-Host "  变更合计字节:       $($headStat.Total_Bytes)"
-        Write-Host ""
-        Write-Host "--- 仅新增代码字节统计 ---" -ForegroundColor Gray
-        Write-Host "  新增代码UTF8总字节: $($headStat.Add_Bytes)"
-
-        return @{ Staged = $stagedStat; Head = $headStat }
+        if ($PassThru) {
+            return [PSCustomObject]@{
+                Staged = $stagedStat
+                Head   = $headStat
+            }
+        }
+        return
     }
 
-    # ---- 有参数: 单模式，输出三种方案 ----
+    # ---- 有参数: 单模式 ----
     $label = if ($Staged) { "暂存区" }
               elseif ($Commit1 -and $Commit2) { "$Commit1 ~ $Commit2" }
               elseif ($Commit1) { "$Commit1 ~ HEAD" }
               else { "HEAD" }
 
     __GitCodeStat_WriteHeader -Title "$label 变更统计" -Color Yellow
-
     $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
     $stat = __GitCodeStat_Compute -DiffLines $diffLines
+    __GitCodeStat_WriteFull -Stat $stat
 
-    Write-Host "--- 字符数统计 ---" -ForegroundColor Gray
-    Write-Host "  新增代码总字符:   $($stat.Add_Char)"
-    Write-Host "  删除代码总字符:   $($stat.Del_Char)"
-    Write-Host "  变更合计字符数:   $($stat.Total_Char)"
-    Write-Host ""
-    Write-Host "--- UTF-8字节统计 ---" -ForegroundColor Gray
-    Write-Host "  新增代码UTF8总字节: $($stat.Add_Bytes)"
-    Write-Host "  删除代码UTF8总字节: $($stat.Del_Bytes)"
-    Write-Host "  变更合计字节:       $($stat.Total_Bytes)"
-    Write-Host ""
-    Write-Host "--- 仅新增代码字节统计 ---" -ForegroundColor Gray
-    Write-Host "  新增代码UTF8总字节: $($stat.Add_Bytes)"
-
-    return $stat
+    if ($PassThru) { return $stat }
 }
 
 
