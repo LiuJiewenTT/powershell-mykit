@@ -65,7 +65,12 @@ function New-VhdDifferencingChild {
     #region 步骤1：处理母盘路径
     if ([string]::IsNullOrWhiteSpace($ParentVhdPath)) {
         Write-Host "`n===== 手动输入母盘VHD/VHDX路径 =====" -ForegroundColor Cyan
-        Write-Host "方式：拖拽文件、Shift+右键复制路径粘贴、手动输入完整路径"
+        Write-Host "可选输入方式："
+        Write-Host "1. Windows Terminal普通权限窗口直接拖拽文件填入；"
+        Write-Host "2. 文件按住【Shift键+右键】→ 复制为路径，Ctrl+V粘贴到此；"
+        Write-Host "3. Win+R运行框拖拽文件，复制路径后粘贴；"
+        Write-Host "4. 手动输入完整文件路径"
+        Write-Host "输入完成按下回车确认`n" -ForegroundColor Cyan
         $ParentVhdPath = Read-Host "母盘文件完整路径"
         # 剔除首尾引号、空格、单引号脏字符
         $trimChars = @('"', "'", ' ')
