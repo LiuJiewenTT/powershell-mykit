@@ -26,7 +26,7 @@ function Show-MsgBox {
     )
 
     try {
-        $result = [System.Windows.MessageBox]::Show($Text, $Title, $Buttons, $Icon)
+        $result = [System.Windows.Forms.MessageBox]::Show($Text, $Title, $Buttons, $Icon)
         return [int]$result
     }
     catch {
@@ -64,6 +64,24 @@ function New-VhdDifferencingChild {
     )
 
     #region 步骤1：处理母盘路径
+    if ([string]::IsNullOrWhiteSpace($ParentVhdPath)) {
+        try {
+            # 优先弹窗选择母盘
+            Add-Type -AssemblyName System.Windows.Forms
+            $dlg = New-Object System.Windows.Forms.OpenFileDialog
+            $dlg.Title = "请选择母盘VHD/VHDX文件"
+            $dlg.Filter = "虚拟磁盘文件(*.vhd;*.vhdx)|*.vhd;*.vhdx|所有文件(*.*)|*.*"
+            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $ParentVhdPath = $dlg.FileName
+            }
+        }
+        catch{
+            Write-Host "文件选择弹窗加载失败，将降级为手动输入路径。" -ForegroundColor Yellow
+            Write-Host "弹窗异常: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+
+    # 弹窗取消或失败后，降级为手动输入
     if ([string]::IsNullOrWhiteSpace($ParentVhdPath)) {
         Write-Host "`n===== 手动输入母盘VHD/VHDX路径 =====" -ForegroundColor Cyan
         Write-Host "可选输入方式："
@@ -112,21 +130,17 @@ Set-VHD -Path "差分盘路径" -ParentPath "新母盘完整路径"
     #region 步骤3：选择子盘保存路径，外部传参则跳过弹窗
     if ([string]::IsNullOrWhiteSpace($ChildVhdPath)) {
         try {
-            # STA线程运行SaveFileDialog
-            $ChildVhdPath = [System.Threading.Tasks.Task]::Run({
-                Add-Type -AssemblyName System.Windows.Forms
-                $dlg = New-Object System.Windows.Forms.SaveFileDialog
-                $dlg.Title = "指定差分子磁盘保存位置与文件名"
-                $dlg.InitialDirectory = $fileInfo.DirectoryName
-                $dlg.FileName = "$($fileInfo.BaseName)_Diff.vhdx"
-                $dlg.Filter = "VHDX磁盘(*.vhdx)|*.vhdx|VHD磁盘(*.vhd)|*.vhd"
-                $dlg.RestoreDirectory = $true
-                $res = $dlg.ShowDialog()
-                if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
-                    return $dlg.FileName
-                }
-                return $null
-            }, [System.Threading.Tasks.TaskCreationOptions]::LongRunning).Result
+            # PowerShell 5.1 & WinForms: 直接调用即可，无需Task.Run避免MTA/STA线程死锁
+            Add-Type -AssemblyName System.Windows.Forms
+            $dlg = New-Object System.Windows.Forms.SaveFileDialog
+            $dlg.Title = "指定差分子磁盘保存位置与文件名"
+            $dlg.InitialDirectory = $fileInfo.DirectoryName
+            $dlg.FileName = "$($fileInfo.BaseName)_Diff.vhdx"
+            $dlg.Filter = "VHDX磁盘(*.vhdx)|*.vhdx|VHD磁盘(*.vhd)|*.vhd"
+            $dlg.RestoreDirectory = $true
+            if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                $ChildVhdPath = $dlg.FileName
+            }
 
             if ([string]::IsNullOrWhiteSpace($ChildVhdPath)) {
                 Write-Host "取消选择保存路径，任务终止" -ForegroundColor DarkCyan
@@ -135,6 +149,7 @@ Set-VHD -Path "差分盘路径" -ParentPath "新母盘完整路径"
         }
         catch {
             Write-Host "文件选择弹窗加载失败，请手动输入子盘完整保存路径：" -ForegroundColor Red
+            Write-Host "弹窗异常: $($_.Exception.Message)" -ForegroundColor Red
             $ChildVhdPath = Read-Host "输出路径"
             $ChildVhdPath = $ChildVhdPath.Trim(@('"', "'", ' '))
             if ([string]::IsNullOrWhiteSpace($ChildVhdPath)) { return }
@@ -165,8 +180,9 @@ Set-VHD -Path "差分盘路径" -ParentPath "新母盘完整路径"
                 [ValidateSet("None","Error","Warning","Information","Question")]
                 [string]$Icon = "None"
             )
+            Add-Type -AssemblyName System.Windows.Forms
             try {
-                $res = [System.Windows.MessageBox]::Show($Text,$Title,$Buttons,$Icon)
+                $res = [System.Windows.Forms.MessageBox]::Show($Text,$Title,$Buttons,$Icon)
                 return [int]$res
             }
             catch {
@@ -182,11 +198,16 @@ Set-VHD -Path "差分盘路径" -ParentPath "新母盘完整路径"
         try {
             # 创建差分VHD
             New-VHD -Path $ChildDisk -ParentPath $ParentDisk -Differencing
-            Write-Host "`n✅ 差分磁盘创建成功！" -ForegroundColor Green
-            Write-Host "子盘路径：$ChildDisk"
-            Write-Host "绑定母盘：$ParentDisk`n"
-            Write-Host "母盘迁移修复命令示例："
-            Write-Host "Set-VHD -Path `"$ChildDisk`" -ParentPath `"D:\新目录\母盘.vhdx`"" -ForegroundColor Yellow
+            $successText = @"
+✅ 差分磁盘创建成功！
+
+子盘路径：$ChildDisk
+绑定母盘：$ParentDisk
+
+母盘迁移修复命令示例：
+Set-VHD -Path "$ChildDisk" -ParentPath "D:\新目录\母盘.vhdx"
+"@
+            Show-MsgBox -Text $successText -Title "创建成功" -Icon Information
 
             # 弹窗询问锁定母盘只读
             $roAns = Show-MsgBox -Text "是否将母盘设置只读属性，防止误写入破坏差分链？`n母盘：$ParentDisk" `
