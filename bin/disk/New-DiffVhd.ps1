@@ -234,18 +234,16 @@ Set-VHD -Path "$ChildDisk" -ParentPath "D:\新目录\母盘.vhdx"
         & $execScript -ParentDisk $ParentVhdPath -ChildDisk $ChildVhdPath
     }
     else {
-        # 普通权限，Base64拉起管理员进程
-        $encodedCommand = [Convert]::ToBase64String(
-            [System.Text.Encoding]::Unicode.GetBytes(
-                "& `$args[0] -ParentDisk `$args[1] -ChildDisk `$args[2]"
-            )
-        )
+        # 普通权限，将完整执行逻辑拼接为字符串，整体Base64编码后拉起管理员进程
+        # 这是为了确保脚本块和参数能被新进程正确接收
+        $commandString = "& { $($execScript.ToString()) } -ParentDisk '$ParentVhdPath' -ChildDisk '$ChildVhdPath'"
+        $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandString))
+
         Write-Host "当前非管理员权限，即将拉起管理员窗口执行创建任务..." -ForegroundColor Yellow
         Start-Process powershell.exe -Verb RunAs -ArgumentList @(
             "-ExecutionPolicy", "Bypass",
             "-NoProfile",
-            "-EncodedCommand", $encodedCommand,
-            $execScript, $ParentVhdPath, $ChildVhdPath
+            "-EncodedCommand", $encodedCommand
         )
         Write-Host "管理员任务已启动，当前窗口可关闭；等待管理员窗口手动回车关闭即可" -ForegroundColor Green
     }
