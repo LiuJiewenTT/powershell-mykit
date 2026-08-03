@@ -30,24 +30,25 @@ function Show-MsgBox {
         return [int]$result
     }
     catch {
-        # 弹窗彻底失败，切换控制台文字交互
-        Write-Host "`n【$Title】`n$Text" -ForegroundColor Yellow
-        if ($Buttons -eq "YesNo") {
-            do {
-                $inp = (Read-Host "请输入 Y 确认 / N 取消").Trim().ToLower()
-            } while ($inp -notin 'y', 'n')
-            # 修复：PS5.1 不支持 return if()，拆分标准if else
-            if ($inp -eq 'y')
-            {
-                return 6
+            # 弹窗彻底失败，切换控制台文字交互
+            Write-Host "`n【$Title】`n$Text" -ForegroundColor Yellow
+            Write-Host "弹窗异常: $($_.Exception.Message)" -ForegroundColor Red
+            if ($Buttons -eq "YesNo") {
+                do {
+                    $inp = (Read-Host "请输入 Y 确认 / N 取消").Trim().ToLower()
+                } while ($inp -notin 'y', 'n')
+                # 修复：PS5.1 不支持 return if()，拆分标准if else
+                if ($inp -eq 'y')
+                {
+                    return 6
+                }
+                else
+                {
+                    return 7
+                }
             }
-            else
-            {
-                return 7
-            }
+            return 1
         }
-        return 1
-    }
 }
 
 <#
@@ -223,7 +224,7 @@ Set-VHD -Path "差分盘路径" -ParentPath "新母盘完整路径"
             "-ExecutionPolicy", "Bypass",
             "-NoProfile",
             "-EncodedCommand", $encodedCommand,
-            "-ArgumentList", $execScript, $ParentVhdPath, $ChildVhdPath
+            $execScript, $ParentVhdPath, $ChildVhdPath
         )
         Write-Host "管理员任务已启动，当前窗口可关闭；等待管理员窗口手动回车关闭即可" -ForegroundColor Green
     }
