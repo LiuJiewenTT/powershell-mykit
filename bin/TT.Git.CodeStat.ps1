@@ -15,11 +15,12 @@
       -Commit1 xxx  → 统计 xxx 到 HEAD 之间变更
       -Commit1 xxx -Commit2 yyy → 统计 xxx 到 yyy 之间变更
       -PassThru     → 返回原始统计对象（供编程使用），否则仅展示不返回
+      -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
 
     边界处理:
       - 首次提交（无 HEAD^）自动切换 --root 模式
       - 二进制文件: git diff 不输出二进制内容，不计入统计
-      - 空行/空格/制表符: 默认全部计入统计
+      - 空行/空格/制表符: 默认全部计入统计，-NoWhitespace 可排除
 .NOTES
     兼容 PowerShell 5.1，无额外模块依赖
 #>
@@ -36,7 +37,8 @@ function __GitCodeStat_Compute {
         [Parameter(Mandatory)]
         [AllowNull()]
         [AllowEmptyCollection()]
-        [string[]]$DiffLines
+        [string[]]$DiffLines,
+        [switch]$NoWhitespace
     )
 
     $utf8 = [System.Text.Encoding]::UTF8
@@ -61,6 +63,12 @@ function __GitCodeStat_Compute {
 
     foreach ($line in $codeLines) {
         $content = $line.Substring(1)  # 去掉行首 + / - 符号
+
+        # -NoWhitespace: 移除所有空白字符（空格、制表符、换行、回车等）
+        if ($NoWhitespace) {
+            $content = $content -replace '\s', ''
+        }
+
         $charLen = $content.Length
         $byteLen = $utf8.GetByteCount($content)
 
@@ -217,11 +225,13 @@ function Get-GitCodeCharStat {
         -Commit1 xxx → xxx..HEAD
         -Commit1 xxx -Commit2 yyy → xxx..yyy
         -PassThru → 返回原始统计对象（供编程使用）
+        -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
     .EXAMPLE
         Get-GitCodeCharStat
         Get-GitCodeCharStat -Staged
         Get-GitCodeCharStat HEAD~3
         Get-GitCodeCharStat v1.0 v2.0
+        Get-GitCodeCharStat -NoWhitespace
         $s = Get-GitCodeCharStat -PassThru
     #>
     [CmdletBinding()]
@@ -231,14 +241,15 @@ function Get-GitCodeCharStat {
         [Parameter(Position = 1)]
         [string]$Commit2,
         [switch]$Staged,
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$NoWhitespace
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
     $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
-    $stat = __GitCodeStat_Compute -DiffLines $diffLines
+    $stat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
 
     Write-Host "新增代码总字符: $($stat.Add_Char)"
     Write-Host "删除代码总字符: $($stat.Del_Char)"
@@ -265,6 +276,7 @@ function Get-GitCodeByteStat {
         Get-GitCodeByteStat -Staged
         Get-GitCodeByteStat HEAD~3
         Get-GitCodeByteStat v1.0 v2.0
+        Get-GitCodeByteStat -NoWhitespace
         $s = Get-GitCodeByteStat -PassThru
     #>
     [CmdletBinding()]
@@ -274,14 +286,15 @@ function Get-GitCodeByteStat {
         [Parameter(Position = 1)]
         [string]$Commit2,
         [switch]$Staged,
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$NoWhitespace
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
     $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
-    $stat = __GitCodeStat_Compute -DiffLines $diffLines
+    $stat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
 
     Write-Host "新增代码UTF8总字节: $($stat.Add_Bytes)"
     Write-Host "删除代码UTF8总字节: $($stat.Del_Bytes)"
@@ -308,6 +321,7 @@ function Get-GitCodeNewByteStat {
         Get-GitCodeNewByteStat -Staged
         Get-GitCodeNewByteStat HEAD~3
         Get-GitCodeNewByteStat v1.0 v2.0
+        Get-GitCodeNewByteStat -NoWhitespace
         $s = Get-GitCodeNewByteStat -PassThru
     #>
     [CmdletBinding()]
@@ -317,14 +331,15 @@ function Get-GitCodeNewByteStat {
         [Parameter(Position = 1)]
         [string]$Commit2,
         [switch]$Staged,
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$NoWhitespace
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
     $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
-    $stat = __GitCodeStat_Compute -DiffLines $diffLines
+    $stat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
 
     Write-Host "新增代码UTF8总字节: $($stat.Add_Bytes)"
 
@@ -347,11 +362,13 @@ function Get-GitCodeStat {
         -Commit1 xxx  → xxx..HEAD（三种方案）
         -Commit1 xxx -Commit2 yyy → xxx..yyy（三种方案）
         -PassThru     → 返回原始统计对象（供编程使用）
+        -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
     .EXAMPLE
         Get-GitCodeStat
         Get-GitCodeStat -Staged
         Get-GitCodeStat HEAD~3
         Get-GitCodeStat v1.0 v2.0
+        Get-GitCodeStat -NoWhitespace
         $r = Get-GitCodeStat -PassThru
     #>
     [CmdletBinding()]
@@ -361,7 +378,8 @@ function Get-GitCodeStat {
         [Parameter(Position = 1)]
         [string]$Commit2,
         [switch]$Staged,
-        [switch]$PassThru
+        [switch]$PassThru,
+        [switch]$NoWhitespace
     )
 
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
@@ -373,13 +391,13 @@ function Get-GitCodeStat {
         # -- 暂存区统计 --
         __GitCodeStat_WriteHeader -Title "暂存区变更统计" -Color Cyan
         $diffLines = __GitCodeStat_GetDiff -Staged
-        $stagedStat = __GitCodeStat_Compute -DiffLines $diffLines
+        $stagedStat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
         __GitCodeStat_WriteFull -Stat $stagedStat
 
         # -- 最新提交统计 --
         __GitCodeStat_WriteHeader -Title "最新提交 HEAD 变更统计" -Color Green
         $diffLines = __GitCodeStat_GetDiff
-        $headStat = __GitCodeStat_Compute -DiffLines $diffLines
+        $headStat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
         __GitCodeStat_WriteFull -Stat $headStat
 
         if ($PassThru) {
@@ -399,7 +417,7 @@ function Get-GitCodeStat {
 
     __GitCodeStat_WriteHeader -Title "$label 变更统计" -Color Yellow
     $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
-    $stat = __GitCodeStat_Compute -DiffLines $diffLines
+    $stat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
     __GitCodeStat_WriteFull -Stat $stat
 
     if ($PassThru) { return $stat }
