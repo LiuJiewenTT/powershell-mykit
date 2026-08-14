@@ -25,6 +25,18 @@
     兼容 PowerShell 5.1，无额外模块依赖
 #>
 
+[CmdletBinding()]
+param(
+    [Parameter(Position = 0)]
+    [string]$Commit1,
+    [Parameter(Position = 1)]
+    [string]$Commit2,
+    [switch]$Staged,
+    [switch]$PassThru,
+    [switch]$NoWhitespace,
+    [switch]$Help
+)
+
 
 # ============================================================
 # 内部辅助函数
@@ -460,5 +472,9 @@ function Get-GitCodeStat {
 # dot-source 加载时不会触发
 # ============================================================
 if ($MyInvocation.InvocationName -ne '.') {
-    Get-GitCodeStat @args
+    if ($Help) {
+        Get-Help $MyInvocation.MyCommand.Path -Full | Out-Host
+        return
+    }
+    Get-GitCodeStat @PSBoundParameters
 }
