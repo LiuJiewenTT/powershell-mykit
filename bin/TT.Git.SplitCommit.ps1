@@ -101,14 +101,13 @@ function __GitSplit_FindRepoRoot {
 
 # 检查暂存区是否有内容
 function __GitSplit_HasStagedChanges {
-    $result = git diff --cached --name-only 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        # 非零退出码可能是: 不在仓库中(129)、git 配置错误等
-        Write-Host "错误：无法获取暂存区文件列表（退出码 $LASTEXITCODE）" -ForegroundColor Red
+    $lines = __GitSplit_RunGitNameLines -Arguments "diff --cached --name-only"
+    if ($null -eq $lines) {
+        Write-Host "错误：无法获取暂存区文件列表" -ForegroundColor Red
         Write-Host "请确认当前目录在 Git 仓库中，且有暂存区内容" -ForegroundColor Red
         return $false
     }
-    if ($null -eq $result -or $result.Count -eq 0) {
+    if ($lines.Count -eq 0) {
         Write-Host "暂存区为空，没有需要拆分的内容" -ForegroundColor Yellow
         return $false
     }
@@ -116,12 +115,121 @@ function __GitSplit_HasStagedChanges {
 }
 
 
-# 计算单个文件在暂存区中的新增 UTF-8 字节数
+# 通过 .NET Process 执行 git 命令，返回原始字节数组
+# 绕过 PS 5.1 管道编码转换（代码页 936 下中文内容会损坏）
+function __GitSplit_RunGitBytes {
+    param([string]$Arguments)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "git"
+    $psi.Arguments = $Arguments
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $process.Start() | Out-Null
+
+    $ms = New-Object System.IO.MemoryStream
+    $process.StandardOutput.BaseStream.CopyTo($ms)
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        $ms.Dispose()
+        return $null
+    }
+
+    $bytes = $ms.ToArray()
+    $ms.Dispose()
+    return $bytes
+}
+
+
+# 获取 git diff --cached 的行数组（UTF-8 正确解码）
+# 返回 $null 表示失败，@() 表示无内容
+function __GitSplit_GetDiffLines {
+    param(
+        [string]$FilePath,
+        [switch]$U0
+    )
+
+    $args = "diff --cached"
+    if ($U0) { $args += " -U0" }
+    $args += " -- `"$FilePath`""
+
+    $bytes = __GitSplit_RunGitBytes -Arguments $args
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $content = $utf8NoBom.GetString($bytes)
+
+    # 统一换行为 LF
+    $content = $content -replace "`r`n", "`n"
+    # 去尾换行
+    if ($content.EndsWith("`n")) {
+        $content = $content.Substring(0, $content.Length - 1)
+    }
+
+    if ([string]::IsNullOrEmpty($content)) { return @() }
+    return @($content -split "`n")
+}
+
+
+# 获取 git diff --cached（无文件过滤）的行数组
+# 用于 IsBinaryFile 等不需要 -U0 的场景
+function __GitSplit_GetDiffLinesFull {
+    param([string]$FilePath)
+
+    $bytes = __GitSplit_RunGitBytes -Arguments "diff --cached -- `"$FilePath`""
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $content = $utf8NoBom.GetString($bytes)
+
+    $content = $content -replace "`r`n", "`n"
+    if ($content.EndsWith("`n")) {
+        $content = $content.Substring(0, $content.Length - 1)
+    }
+
+    if ([string]::IsNullOrEmpty($content)) { return @() }
+    return @($content -split "`n")
+}
+
+
+# 通过 .NET Process 执行 git 命令，返回行数组（UTF-8 解码，过滤空行）
+# 适用于 --name-only / --name-status 等简单输出
+# 返回 $null 表示命令失败，@() 表示无输出
+function __GitSplit_RunGitNameLines {
+    param([string]$Arguments)
+
+    $bytes = __GitSplit_RunGitBytes -Arguments $Arguments
+    if ($null -eq $bytes) { return $null }
+    if ($bytes.Length -eq 0) { return @() }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $content = $utf8NoBom.GetString($bytes)
+
+    $content = $content -replace "`r`n", "`n"
+    if ($content.EndsWith("`n")) {
+        $content = $content.Substring(0, $content.Length - 1)
+    }
+
+    if ([string]::IsNullOrEmpty($content)) { return @() }
+
+    # 过滤空行，返回非空行数组
+    $lines = @($content -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    return $lines
+}
+
+
 function __GitSplit_GetFileBytes {
     param([string]$FilePath)
 
-    $diff = git diff --cached -U0 -- $FilePath 2>$null
-    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+    $diff = __GitSplit_GetDiffLines -FilePath $FilePath -U0
+    if ($null -eq $diff -or $diff.Count -eq 0) {
         return 0
     }
 
@@ -143,7 +251,7 @@ function __GitSplit_GetFileBytes {
 function __GitSplit_IsBinaryFile {
     param([string]$FilePath)
 
-    $diff = git diff --cached -- $FilePath 2>$null
+    $diff = __GitSplit_GetDiffLinesFull -FilePath $FilePath
     if ($null -eq $diff -or $diff.Count -eq 0) {
         return $false
     }
@@ -161,8 +269,8 @@ function __GitSplit_IsBinaryFile {
 function __GitSplit_GetFileDiffHeader {
     param([string]$FilePath)
 
-    $diff = git diff --cached -U0 -- $FilePath 2>$null
-    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+    $diff = __GitSplit_GetDiffLines -FilePath $FilePath -U0
+    if ($null -eq $diff -or $diff.Count -eq 0) {
         return $null
     }
 
@@ -188,8 +296,8 @@ function __GitSplit_GetFileDiffHeader {
 function __GitSplit_ParseHunks {
     param([string]$FilePath)
 
-    $diff = git diff --cached -U0 -- $FilePath 2>$null
-    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+    $diff = __GitSplit_GetDiffLines -FilePath $FilePath -U0
+    if ($null -eq $diff -or $diff.Count -eq 0) {
         return @()
     }
 
@@ -385,10 +493,12 @@ function __GitSplit_GreedyPack {
 function __GitSplit_GetStagedFileInfo {
     param([string]$FilePath)
 
-    $statusLine = git diff --cached --name-status -- $FilePath 2>$null
-    if ($null -eq $statusLine -or $statusLine.Count -eq 0) {
+    $statusLines = __GitSplit_RunGitNameLines -Arguments "diff --cached --name-status -- `"$FilePath`""
+    if ($null -eq $statusLines -or $statusLines.Count -eq 0) {
         return $null
     }
+
+    $statusLine = $statusLines[0]
 
     $statusChar = ($statusLine -split "`t")[0]
     if ($statusChar.StartsWith('D')) {
@@ -419,31 +529,10 @@ function __GitSplit_GetHeadContentBytes {
         return [byte[]]@()
     }
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "git"
-    $psi.Arguments = "cat-file -p HEAD:$FilePath"
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = (Get-Location).Path
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-    $process.Start() | Out-Null
-
-    $ms = New-Object System.IO.MemoryStream
-    $process.StandardOutput.BaseStream.CopyTo($ms)
-    $process.WaitForExit()
-
-    if ($process.ExitCode -ne 0) {
-        $ms.Dispose()
+    $bytes = __GitSplit_RunGitBytes -Arguments "cat-file -p HEAD:$FilePath"
+    if ($null -eq $bytes) {
         return [byte[]]@()
     }
-
-    $bytes = $ms.ToArray()
-    $ms.Dispose()
-
     return $bytes
 }
 
@@ -702,16 +791,15 @@ function Split-GitStagedCommit {
     __GitSplit_CleanStaleTemp
 
     # 获取暂存区文件列表
-    $stagedFiles = git diff --cached --name-only 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "错误：无法获取暂存区文件列表（退出码 $LASTEXITCODE）" -ForegroundColor Red
+    $stagedFiles = __GitSplit_RunGitNameLines -Arguments "diff --cached --name-only"
+    if ($null -eq $stagedFiles) {
+        Write-Host "错误：无法获取暂存区文件列表" -ForegroundColor Red
         return
     }
-    if ($null -eq $stagedFiles -or $stagedFiles.Count -eq 0) {
+    if ($stagedFiles.Count -eq 0) {
         Write-Host "暂存区为空" -ForegroundColor Yellow
         return
     }
-    $stagedFiles = @($stagedFiles)
 
     # 保存暂存区文件信息（mode + blob hash），reset 后需要
     $stagedInfo = @{}
@@ -969,33 +1057,8 @@ function Split-GitStagedCommit {
 
 
 # 获取完整暂存区 diff 的字节数组（用于备份恢复）
-# 使用 .NET Process 直接读字节流，绕过 PS 5.1 编码转换
 function __GitSplit_GetAllStagedDiffBytes {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = "git"
-    $psi.Arguments = "diff --cached"
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $psi.WorkingDirectory = (Get-Location).Path
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $psi
-    $process.Start() | Out-Null
-
-    $ms = New-Object System.IO.MemoryStream
-    $process.StandardOutput.BaseStream.CopyTo($ms)
-    $process.WaitForExit()
-
-    if ($process.ExitCode -ne 0) {
-        $ms.Dispose()
-        return $null
-    }
-
-    $bytes = $ms.ToArray()
-    $ms.Dispose()
-    return $bytes
+    return __GitSplit_RunGitBytes -Arguments "diff --cached"
 }
 
 
