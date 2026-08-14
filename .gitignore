@@ -1,5 +1,5 @@
 /.vscode/
-/keep_local/
+keep_local/
 /mybackup/
 *.json
 /net_config_classes.txt
