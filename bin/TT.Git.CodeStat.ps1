@@ -176,6 +176,23 @@ function __GitCodeStat_ValidateParams {
 }
 
 
+# 帮助请求拦截: -Help 转发到 Get-Help
+# --help / -? 由 PowerShell [CmdletBinding()] 原生处理，此处不重复
+# 返回 $true 表示已拦截(调用方应 return)，$false 表示正常执行
+function __GitCodeStat_HelpInterceptor {
+    param(
+        [string]$CommandName,
+        [switch]$Help
+    )
+
+    if ($Help) {
+        Get-Help $CommandName -Full | Out-Host
+        return $true
+    }
+    return $false
+}
+
+
 # 打印区块分隔标题（两端固定 16 个 =，中间标题自然嵌入）
 function __GitCodeStat_WriteHeader {
     param([string]$Title, [System.ConsoleColor]$Color = 'White')
@@ -226,12 +243,14 @@ function Get-GitCodeCharStat {
         -Commit1 xxx -Commit2 yyy → xxx..yyy
         -PassThru → 返回原始统计对象（供编程使用）
         -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
+        -Help → 显示完整帮助（等同 Get-Help -Full）
     .EXAMPLE
         Get-GitCodeCharStat
         Get-GitCodeCharStat -Staged
         Get-GitCodeCharStat HEAD~3
         Get-GitCodeCharStat v1.0 v2.0
         Get-GitCodeCharStat -NoWhitespace
+        Get-GitCodeCharStat -Help
         $s = Get-GitCodeCharStat -PassThru
     #>
     [CmdletBinding()]
@@ -242,9 +261,11 @@ function Get-GitCodeCharStat {
         [string]$Commit2,
         [switch]$Staged,
         [switch]$PassThru,
-        [switch]$NoWhitespace
+        [switch]$NoWhitespace,
+        [switch]$Help
     )
 
+    if (__GitCodeStat_HelpInterceptor -CommandName 'Get-GitCodeCharStat' -Help:$Help) { return }
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
@@ -277,6 +298,7 @@ function Get-GitCodeByteStat {
         Get-GitCodeByteStat HEAD~3
         Get-GitCodeByteStat v1.0 v2.0
         Get-GitCodeByteStat -NoWhitespace
+        Get-GitCodeByteStat -Help
         $s = Get-GitCodeByteStat -PassThru
     #>
     [CmdletBinding()]
@@ -287,9 +309,11 @@ function Get-GitCodeByteStat {
         [string]$Commit2,
         [switch]$Staged,
         [switch]$PassThru,
-        [switch]$NoWhitespace
+        [switch]$NoWhitespace,
+        [switch]$Help
     )
 
+    if (__GitCodeStat_HelpInterceptor -CommandName 'Get-GitCodeByteStat' -Help:$Help) { return }
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
@@ -322,6 +346,7 @@ function Get-GitCodeNewByteStat {
         Get-GitCodeNewByteStat HEAD~3
         Get-GitCodeNewByteStat v1.0 v2.0
         Get-GitCodeNewByteStat -NoWhitespace
+        Get-GitCodeNewByteStat -Help
         $s = Get-GitCodeNewByteStat -PassThru
     #>
     [CmdletBinding()]
@@ -332,9 +357,11 @@ function Get-GitCodeNewByteStat {
         [string]$Commit2,
         [switch]$Staged,
         [switch]$PassThru,
-        [switch]$NoWhitespace
+        [switch]$NoWhitespace,
+        [switch]$Help
     )
 
+    if (__GitCodeStat_HelpInterceptor -CommandName 'Get-GitCodeNewByteStat' -Help:$Help) { return }
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
@@ -363,12 +390,14 @@ function Get-GitCodeStat {
         -Commit1 xxx -Commit2 yyy → xxx..yyy（三种方案）
         -PassThru     → 返回原始统计对象（供编程使用）
         -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
+        -Help → 显示完整帮助（等同 Get-Help -Full）
     .EXAMPLE
         Get-GitCodeStat
         Get-GitCodeStat -Staged
         Get-GitCodeStat HEAD~3
         Get-GitCodeStat v1.0 v2.0
         Get-GitCodeStat -NoWhitespace
+        Get-GitCodeStat -Help
         $r = Get-GitCodeStat -PassThru
     #>
     [CmdletBinding()]
@@ -379,9 +408,11 @@ function Get-GitCodeStat {
         [string]$Commit2,
         [switch]$Staged,
         [switch]$PassThru,
-        [switch]$NoWhitespace
+        [switch]$NoWhitespace,
+        [switch]$Help
     )
 
+    if (__GitCodeStat_HelpInterceptor -CommandName 'Get-GitCodeStat' -Help:$Help) { return }
     if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
     if (-not (__GitCodeStat_CheckRepo)) { return }
 
