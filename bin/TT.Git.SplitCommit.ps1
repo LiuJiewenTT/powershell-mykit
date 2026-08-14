@@ -5,6 +5,9 @@
     将当前暂存区（staged）的变更按 UTF-8 字节大小拆分为多个提交，
     每个提交不超过指定字节上限。提交注释自动追加序号后缀。
 
+      用户命令:
+        Split-GitStagedCommit - 将暂存区按字节大小拆分为多个提交
+
     工作流程:
       1. 获取暂存区文件列表（git diff --cached --name-only）
       2. 逐文件计算 UTF-8 新增字节数
@@ -37,6 +40,14 @@
       - 支持新增文件和修改已有文件
 .NOTES
     兼容 PowerShell 5.1，无额外模块依赖
+
+    dot-source 加载后可用:
+      Split-GitStagedCommit -MaxBytes <字节数> -Message <前缀> [-DryRun] [-Help]
+.EXAMPLE
+    . G:\path\TT.Git.SplitCommit.ps1
+    Split-GitStagedCommit -MaxBytes 10240 -Message "feature: 新增模块"
+    Split-GitStagedCommit -MaxBytes 5120 -Message "feat" -DryRun
+    Split-GitStagedCommit -MaxBytes 10000 -Message "refactor" -Help
 #>
 
 [CmdletBinding()]
