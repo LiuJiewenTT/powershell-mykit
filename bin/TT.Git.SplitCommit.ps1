@@ -69,21 +69,43 @@ param(
 # ============================================================
 
 # 检查当前目录是否在 Git 仓库内
+# 通过文件系统查找 .git，避免 git 输出在代码页 936 下中文路径乱码
 function __GitSplit_CheckRepo {
-    $null = git rev-parse --is-inside-work-tree 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "错误：当前目录不是 Git 仓库" -ForegroundColor Red
+    $dir = __GitSplit_FindRepoRoot
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        Write-Host "错误：当前目录不在 Git 仓库中" -ForegroundColor Red
         return $false
     }
     return $true
 }
 
+# 从当前目录向上查找 .git，返回仓库根目录（空字符串表示未找到）
+# 纯文件系统操作，不受代码页/编码影响
+function __GitSplit_FindRepoRoot {
+    $dir = (Get-Location).Path
+    while (-not [string]::IsNullOrEmpty($dir)) {
+        if (Test-Path (Join-Path $dir '.git') -PathType Container) {
+            return $dir
+        }
+        # .git 也可能是文件（worktree 指向实际 .git 目录）
+        if (Test-Path (Join-Path $dir '.git') -PathType Leaf) {
+            return $dir
+        }
+        $parent = Split-Path $dir -Parent
+        if ($parent -eq $dir) { break }
+        $dir = $parent
+    }
+    return ''
+}
+
 
 # 检查暂存区是否有内容
 function __GitSplit_HasStagedChanges {
-    $result = git diff --cached --name-only
+    $result = git diff --cached --name-only 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "错误：无法获取暂存区文件列表" -ForegroundColor Red
+        # 非零退出码可能是: 不在仓库中(129)、git 配置错误等
+        Write-Host "错误：无法获取暂存区文件列表（退出码 $LASTEXITCODE）" -ForegroundColor Red
+        Write-Host "请确认当前目录在 Git 仓库中，且有暂存区内容" -ForegroundColor Red
         return $false
     }
     if ($null -eq $result -or $result.Count -eq 0) {
@@ -531,8 +553,8 @@ function __GitSplit_ApplyHunksToContent {
 
 # 临时文件路径管理
 function __GitSplit_GetTempDir {
-    $repoRoot = git rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
+    $repoRoot = __GitSplit_FindRepoRoot
+    if ([string]::IsNullOrWhiteSpace($repoRoot)) {
         return $env:TEMP
     }
     # 使用 .git/TT.ToolKit/split-tmp/ —— Git 内部目录，天然被忽略，不依赖项目 .gitignore
@@ -569,8 +591,8 @@ function __GitSplit_CleanStaleTemp {
 
 # 清理空的临时目录：split-tmp/ 为空则删除，TT.ToolKit/ 为空也删除
 function __GitSplit_CleanEmptyTempDirs {
-    $repoRoot = git rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) { return }
+    $repoRoot = __GitSplit_FindRepoRoot
+    if ([string]::IsNullOrWhiteSpace($repoRoot)) { return }
 
     $splitTmp = Join-Path $repoRoot ".git\TT.ToolKit\split-tmp"
     $toolKit  = Join-Path $repoRoot ".git\TT.ToolKit"
@@ -651,11 +673,14 @@ function Split-GitStagedCommit {
     # 切换到仓库根目录，确保所有 git 命令使用仓库根相对路径
     # 子目录运行时 git diff --cached --name-only 只返回当前子目录的文件，
     # 需要在根目录才能获取完整的暂存区文件列表
-    $repoRoot = git rev-parse --show-toplevel 2>$null
+    # 使用文件系统查找而非 git 输出，避免代码页 936 下中文路径乱码
+    $repoRoot = __GitSplit_FindRepoRoot
     $pushedLocation = $false
-    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($repoRoot)) {
-        $currentDir = (Get-Location).Path
-        if ($currentDir -ne $repoRoot) {
+    if (-not [string]::IsNullOrWhiteSpace($repoRoot)) {
+        # 规范化路径后再比较（消除尾随反斜杠差异）
+        $currentDirNorm = ((Get-Location).Path).TrimEnd('\')
+        $repoRootNorm = $repoRoot.TrimEnd('\')
+        if ($currentDirNorm -ne $repoRootNorm) {
             Push-Location $repoRoot
             $pushedLocation = $true
         }
@@ -677,9 +702,9 @@ function Split-GitStagedCommit {
     __GitSplit_CleanStaleTemp
 
     # 获取暂存区文件列表
-    $stagedFiles = git diff --cached --name-only
+    $stagedFiles = git diff --cached --name-only 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "错误：无法获取暂存区文件列表" -ForegroundColor Red
+        Write-Host "错误：无法获取暂存区文件列表（退出码 $LASTEXITCODE）" -ForegroundColor Red
         return
     }
     if ($null -eq $stagedFiles -or $stagedFiles.Count -eq 0) {
