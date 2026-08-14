@@ -747,7 +747,7 @@ function __GitSplit_GetHeadContentBytes {
 #   HeadBytes   HEAD 版本的原始字节
 #   AllHunks    该文件的所有 hunk（按顺序）
 #   UpToIndex   应用 hunk 0..UpToIndex（含）
-# 返回: 应用后的内容字节（UTF-8 无 BOM）
+# 返回: 应用后的内容字节（保留原始 BOM 和行尾格式）
 function __GitSplit_ApplyHunksToContent {
     param(
         [byte[]]$HeadBytes,
@@ -757,7 +757,17 @@ function __GitSplit_ApplyHunksToContent {
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
-    # 字节转字符串
+    # ---- 检测原始字节的 BOM 和行尾特征 ----
+    $hasBom = ($HeadBytes.Length -ge 3 -and $HeadBytes[0] -eq 0xEF -and $HeadBytes[1] -eq 0xBB -and $HeadBytes[2] -eq 0xBF)
+    $hasCrlf = $false
+    for ($b = 0; $b -lt $HeadBytes.Length - 1; $b++) {
+        if ($HeadBytes[$b] -eq 0x0D -and $HeadBytes[$b + 1] -eq 0x0A) {
+            $hasCrlf = $true
+            break
+        }
+    }
+
+    # 字节转字符串（UTF8Encoding 自动吞掉 BOM，不影响后续操作）
     if ($HeadBytes.Length -eq 0) {
         $content = ""
     } else {
@@ -767,7 +777,7 @@ function __GitSplit_ApplyHunksToContent {
     # 判断是否有尾换行
     $hasTrailingNewline = $content.EndsWith("`n")
 
-    # 统一换行为 LF
+    # 统一换行为 LF（仅用于行操作，输出时按原格式恢复）
     $content = $content -replace "`r`n", "`n"
 
     # 去掉尾部换行以便按行处理
@@ -840,13 +850,31 @@ function __GitSplit_ApplyHunksToContent {
         }
     }
 
-    # 重建内容
+    # 重建内容（用 LF 连接）
     $result = $lines -join "`n"
     if ($hasTrailingNewline -and $lines.Count -gt 0) {
         $result += "`n"
     }
 
-    return $utf8NoBom.GetBytes($result)
+    # ---- 恢复原始行尾格式 ----
+    if ($hasCrlf) {
+        # LF → CRLF（仅转换行间的 \n，不触碰行内容中的裸 \n）
+        $result = $result -replace "(?<!\r)\n", "`r`n"
+    }
+
+    # 编码为字节
+    $bytes = $utf8NoBom.GetBytes($result)
+
+    # ---- 恢复 BOM ----
+    if ($hasBom) {
+        $bomBytes = [byte[]]@(0xEF, 0xBB, 0xBF)
+        $combined = New-Object byte[] ($bomBytes.Length + $bytes.Length)
+        [Array]::Copy($bomBytes, 0, $combined, 0, $bomBytes.Length)
+        [Array]::Copy($bytes, 0, $combined, $bomBytes.Length, $bytes.Length)
+        $bytes = $combined
+    }
+
+    return $bytes
 }
 
 
