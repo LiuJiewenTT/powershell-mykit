@@ -152,7 +152,8 @@ function __GitSplit_RunGitBytes {
 
     $bytes = $ms.ToArray()
     $ms.Dispose()
-    return $bytes
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
+    return ,$bytes
 }
 
 
@@ -168,8 +169,9 @@ function __GitSplit_GetDiffLines {
     if ($U0) { $args += " -U0" }
     $args += " -- `"$FilePath`""
 
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
     $bytes = __GitSplit_RunGitBytes -Arguments $args
-    if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return ,@() }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $content = $utf8NoBom.GetString($bytes)
@@ -181,8 +183,8 @@ function __GitSplit_GetDiffLines {
         $content = $content.Substring(0, $content.Length - 1)
     }
 
-    if ([string]::IsNullOrEmpty($content)) { return @() }
-    return @($content -split "`n")
+    if ([string]::IsNullOrEmpty($content)) { return ,@() }
+    return ,@($content -split "`n")
 }
 
 
@@ -191,8 +193,9 @@ function __GitSplit_GetDiffLines {
 function __GitSplit_GetDiffLinesFull {
     param([string]$FilePath)
 
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
     $bytes = __GitSplit_RunGitBytes -Arguments "diff --cached -- `"$FilePath`""
-    if ($null -eq $bytes -or $bytes.Length -eq 0) { return @() }
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return ,@() }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $content = $utf8NoBom.GetString($bytes)
@@ -202,8 +205,8 @@ function __GitSplit_GetDiffLinesFull {
         $content = $content.Substring(0, $content.Length - 1)
     }
 
-    if ([string]::IsNullOrEmpty($content)) { return @() }
-    return @($content -split "`n")
+    if ([string]::IsNullOrEmpty($content)) { return ,@() }
+    return ,@($content -split "`n")
 }
 
 
@@ -213,9 +216,10 @@ function __GitSplit_GetDiffLinesFull {
 function __GitSplit_RunGitNameLines {
     param([string]$Arguments)
 
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
     $bytes = __GitSplit_RunGitBytes -Arguments $Arguments
     if ($null -eq $bytes) { return $null }
-    if ($bytes.Length -eq 0) { return @() }
+    if ($bytes.Length -eq 0) { return ,@() }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     $content = $utf8NoBom.GetString($bytes)
@@ -225,11 +229,11 @@ function __GitSplit_RunGitNameLines {
         $content = $content.Substring(0, $content.Length - 1)
     }
 
-    if ([string]::IsNullOrEmpty($content)) { return @() }
+    if ([string]::IsNullOrEmpty($content)) { return ,@() }
 
     # 过滤空行，返回非空行数组
     $lines = @($content -split "`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    return $lines
+    return ,$lines
 }
 
 
@@ -301,7 +305,7 @@ function __GitSplit_ParseEolsFromBytes {
     $eols = [System.Collections.ArrayList]::new()
 
     if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
-        return $eols.ToArray()
+        return ,$eols.ToArray()
     }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
@@ -333,7 +337,8 @@ function __GitSplit_ParseEolsFromBytes {
         }
     }
 
-    return $eols.ToArray()
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
+    return ,$eols.ToArray()
 }
 
 
@@ -351,12 +356,12 @@ function __GitSplit_ParseHunks {
 
     $diff = __GitSplit_GetDiffLines -FilePath $FilePath -U0
     if ($null -eq $diff -or $diff.Count -eq 0) {
-        return @()
+        return ,@()
     }
 
     $utf8 = [System.Text.Encoding]::UTF8
     $header = __GitSplit_GetFileDiffHeader -FilePath $FilePath
-    if ($null -eq $header -or $header.Count -eq 0) { return @() }
+    if ($null -eq $header -or $header.Count -eq 0) { return ,@() }
 
     $headerLineCount = $header.Count
     $hunks = [System.Collections.ArrayList]::new()
@@ -395,7 +400,8 @@ function __GitSplit_ParseHunks {
         $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes))
     }
 
-    return $hunks
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
+    return ,$hunks
 }
 
 
@@ -485,7 +491,7 @@ function __GitSplit_SplitSingleHunk {
 
     # 如果 + 行数 <= 1，无法再拆分，直接返回原 hunk
     if ($addLines.Count -le 1) {
-        return @($Hunk)
+        return ,@($Hunk)
     }
 
     # 贪心分组：将 + 行按 MaxBytes 分成多组
@@ -517,7 +523,7 @@ function __GitSplit_SplitSingleHunk {
 
     # 只分出1组 → 无需拆分
     if ($groups.Count -le 1) {
-        return @($Hunk)
+        return ,@($Hunk)
     }
 
     # 解析原始 @@ 头中的 OldStart / OldCount
@@ -640,7 +646,8 @@ function __GitSplit_SplitSingleHunk {
         $null = $subHunks.Add($subHunk)
     }
 
-    return $subHunks.ToArray()
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
+    return ,$subHunks.ToArray()
 }
 
 
@@ -657,7 +664,7 @@ function __GitSplit_SplitFileByHunks {
 
     $hunks = __GitSplit_ParseHunks -FilePath $FilePath
     if ($null -eq $hunks -or $hunks.Count -eq 0) {
-        return @()
+        return ,@()
     }
 
     # 对超限的单个 hunk 按行拆分
@@ -710,7 +717,8 @@ function __GitSplit_SplitFileByHunks {
         })
     }
 
-    return $hunkBatches
+    # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
+    return ,$hunkBatches
 }
 
 
@@ -726,7 +734,7 @@ function __GitSplit_GreedyPack {
     )
 
     if (-not $FileList -or $FileList.Count -eq 0) {
-        return @()
+        return ,@()
     }
 
     $fileBytes = @()
@@ -1441,6 +1449,14 @@ function Split-GitStagedCommit {
 
     # 清空暂存区
     Write-Host "  清空暂存区（不修改工作区）..." -ForegroundColor Cyan
+
+    # 清理可能残留的 index.lock（前次崩溃或竞态条件可能留下）
+    $lockPath = Join-Path (__GitSplit_FindRepoRoot) ".git\index.lock"
+    if (Test-Path $lockPath) {
+        Write-Host "  发现残留 index.lock，自动清理..." -ForegroundColor Yellow
+        Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+    }
+
     git reset -q 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  git reset 失败" -ForegroundColor Red
@@ -1543,7 +1559,23 @@ function __GitSplit_GetAllStagedDiffBytes {
 }
 
 
+# 清理可能残留的 .git/index.lock（竞态条件或崩溃可能留下）
+# 返回 $true 表示清理了 lock 文件
+function __GitSplit_CleanIndexLock {
+    $repoRoot = __GitSplit_FindRepoRoot
+    if ([string]::IsNullOrWhiteSpace($repoRoot)) { return $false }
+
+    $lockPath = Join-Path $repoRoot ".git\index.lock"
+    if (Test-Path $lockPath) {
+        Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+    return $false
+}
+
+
 # 整文件提交：用 blob hash + update-index 恢复到暂存区，然后 commit
+# 包含 index.lock 竞态防护：失败时清理 lock 并重试一次
 function __GitSplit_CommitFiles {
     param(
         [object[]]$FileInfos,
@@ -1559,8 +1591,20 @@ function __GitSplit_CommitFiles {
             git update-index --add --cacheinfo "$($info.Mode),$($info.Hash),$($info.Path)" 2>$null
         }
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "    git update-index 失败: $($info.Path)" -ForegroundColor Red
-            return $false
+            # index.lock 竞态防护：清理 lock 后重试一次
+            $cleaned = __GitSplit_CleanIndexLock
+            if ($cleaned) {
+                Start-Sleep -Milliseconds 200
+                if ($info.Status -eq 'D') {
+                    git update-index --force-remove -- $info.Path 2>$null
+                } else {
+                    git update-index --add --cacheinfo "$($info.Mode),$($info.Hash),$($info.Path)" 2>$null
+                }
+            }
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "    git update-index 失败: $($info.Path)" -ForegroundColor Red
+                return $false
+            }
         }
     }
 
@@ -1568,6 +1612,15 @@ function __GitSplit_CommitFiles {
     if ($LASTEXITCODE -eq 0) {
         return $true
     } else {
+        # index.lock 竞态防护
+        $cleaned = __GitSplit_CleanIndexLock
+        if ($cleaned) {
+            Start-Sleep -Milliseconds 200
+            $result = git commit -m $CommitMsg 2>&1
+        }
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
         Write-Host "    git commit 失败: $result" -ForegroundColor Red
         return $false
     }
@@ -1612,18 +1665,35 @@ function __GitSplit_CommitHunks {
         return $false
     }
 
-    # 更新暂存区
+    # 更新暂存区（含 index.lock 竞态防护）
     git update-index --add --cacheinfo "$Mode,$blobHash,$FilePath" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "    git update-index 失败" -ForegroundColor Red
-        return $false
+        # index.lock 竞态防护：清理 lock 后重试一次
+        $cleaned = __GitSplit_CleanIndexLock
+        if ($cleaned) {
+            Start-Sleep -Milliseconds 200
+            git update-index --add --cacheinfo "$Mode,$blobHash,$FilePath" 2>$null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    git update-index 失败: $FilePath" -ForegroundColor Red
+            return $false
+        }
     }
 
-    # 提交
+    # 提交（含 index.lock 竞态防护）
     $result = git commit -m $CommitMsg 2>&1
     if ($LASTEXITCODE -eq 0) {
         return $true
     } else {
+        # index.lock 竞态防护
+        $cleaned = __GitSplit_CleanIndexLock
+        if ($cleaned) {
+            Start-Sleep -Milliseconds 200
+            $result = git commit -m $CommitMsg 2>&1
+        }
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
         Write-Host "    git commit 失败: $result" -ForegroundColor Red
         return $false
     }
