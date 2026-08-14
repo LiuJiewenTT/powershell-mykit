@@ -887,22 +887,38 @@ function Split-GitStagedCommit {
                 $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes
                 $allHunks = __GitSplit_ParseHunks -FilePath $f
                 $fMode = if ($null -ne $stagedInfo[$f]) { $stagedInfo[$f].Mode } else { '100644' }
-                $hunkIdx = 0
-                foreach ($hb in $hunkBatches) {
-                    $hunkIdx += $hb.Hunks.Count
+
+                # 只有1批 → 实际未切分，按整文件提交
+                if ($hunkBatches.Count -le 1) {
                     $seq++
                     $null = $commitPlan.Add([PSCustomObject]@{
-                        Type      = 'hunks'
-                        FilePath  = $f
-                        Mode      = $fMode
-                        AllHunks  = $allHunks
-                        UpToIndex = $hunkIdx - 1
-                        Hunks     = $hb.Hunks
-                        Bytes     = $hb.AddBytes
+                        Type      = 'files'
+                        Files     = @($f)
+                        FileInfos = @($stagedInfo[$f])
+                        Bytes     = $fileBytes
                         Seq       = $seq
                         CommitMsg = "$Message #$seq"
-                        Note      = "hunk 切分"
+                        Note      = "超限但仅1个hunk，整文件提交"
                     })
+                }
+                else {
+                    $hunkIdx = 0
+                    foreach ($hb in $hunkBatches) {
+                        $hunkIdx += $hb.Hunks.Count
+                        $seq++
+                        $null = $commitPlan.Add([PSCustomObject]@{
+                            Type      = 'hunks'
+                            FilePath  = $f
+                            Mode      = $fMode
+                            AllHunks  = $allHunks
+                            UpToIndex = $hunkIdx - 1
+                            Hunks     = $hb.Hunks
+                            Bytes     = $hb.AddBytes
+                            Seq       = $seq
+                            CommitMsg = "$Message #$seq"
+                            Note      = "hunk 切分为 $($hunkBatches.Count) 批"
+                        })
+                    }
                 }
             }
         }
@@ -924,7 +940,7 @@ function Split-GitStagedCommit {
         }
         else {
             $hunkCount = $item.Hunks.Count
-            Write-Host "  文件: $($item.FilePath)  [hunk 切分, $hunkCount 个 hunk]" -ForegroundColor Gray
+            Write-Host "  文件: $($item.FilePath)  [切分提交, 本批 $hunkCount 个 hunk]" -ForegroundColor Gray
         }
         if ($item.Note) {
             Write-Host "  备注: $($item.Note)" -ForegroundColor Magenta
