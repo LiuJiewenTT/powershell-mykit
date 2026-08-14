@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Git 暂存区拆分提交工具 - 按字节大小自动分批提交
+    Git 暂存区拆分提交工具 - 按字节大小自动分批提交（支持 hunk 级切分）
 .DESCRIPTION
     将当前暂存区（staged）的变更按 UTF-8 字节大小拆分为多个提交，
     每个提交不超过指定字节上限。提交注释自动追加序号后缀。
@@ -9,7 +9,8 @@
       1. 获取暂存区文件列表（git diff --cached --name-only）
       2. 逐文件计算 UTF-8 新增字节数
       3. 贪心装箱：累加文件字节，不超过 MaxBytes 则放入当前批，否则新开一批
-      4. 对每批：git reset 暂存区 → git add 该批文件 → git commit
+      4. 超限文件自动按 hunk 切分，分多次提交
+      5. 逐批提交：整文件用 blob hash + update-index，hunk 切分用 hash-object + update-index
 
     参数说明:
       -MaxBytes    → 每个提交的字节上限（必填，单位：字节）
@@ -17,11 +18,23 @@
       -DryRun      → 仅模拟分批结果，不执行 git add / commit
       -Help        → 显示完整帮助（等同 Get-Help -Full）
 
+    未暂存改动保护:
+      - 所有操作仅针对暂存区，不修改工作区文件
+      - git commit 只提交暂存区内容，工作区改动不受影响
+      - 无需 stash，无需 stash pop
+      - 执行前保存完整 diff 到 keep_local/.git-split-tmp/，出错可恢复
+
+    临时文件:
+      - 临时文件存放在 keep_local/.git-split-tmp/（被 .gitignore 忽略）
+      - 文件名含 PID 和时间戳，防止并发冲突
+      - 正常完成后自动清理；异常退出时保留，可用于手动恢复
+
     注意事项:
       - 操作对象仅为暂存区（staged），不涉及工作区未跟踪文件
-      - 执行前会先 git reset 清空暂存区再重新分批 add
       - 不会执行 git push，仅本地提交
-      - 单个文件字节超上限时，该文件独立成一批（不会跳过）
+      - 单个文件字节超上限时，自动按 hunk 切分多次提交
+      - 二进制文件无法切分，超限时独立成一批提交
+      - 支持新增文件和修改已有文件
 .NOTES
     兼容 PowerShell 5.1，无额外模块依赖
 #>
@@ -71,7 +84,6 @@ function __GitSplit_HasStagedChanges {
 
 
 # 计算单个文件在暂存区中的新增 UTF-8 字节数
-# 使用 git diff --cached -U0 -- <file> 只取变更行，避免全文件内容
 function __GitSplit_GetFileBytes {
     param([string]$FilePath)
 
@@ -84,7 +96,6 @@ function __GitSplit_GetFileBytes {
     $addByte = 0
 
     foreach ($line in $diff) {
-        # 只统计 + 开头的真实代码行，排除 +++ 文件标记
         if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
             $content = $line.Substring(1)
             $addByte += $utf8.GetByteCount($content)
@@ -95,7 +106,452 @@ function __GitSplit_GetFileBytes {
 }
 
 
-# 帮助请求拦截: -Help 转发到 Get-Help
+# 检查文件是否为二进制文件
+function __GitSplit_IsBinaryFile {
+    param([string]$FilePath)
+
+    $diff = git diff --cached -- $FilePath 2>$null
+    if ($null -eq $diff -or $diff.Count -eq 0) {
+        return $false
+    }
+    foreach ($line in ($diff | Select-Object -First 5)) {
+        if ($line -match 'Binary files') {
+            return $true
+        }
+    }
+    return $false
+}
+
+
+# 获取文件的 diff 头部（diff --git / index / --- / +++）
+# 截取第一个 @@ 之前的所有行
+function __GitSplit_GetFileDiffHeader {
+    param([string]$FilePath)
+
+    $diff = git diff --cached -U0 -- $FilePath 2>$null
+    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+        return $null
+    }
+
+    $header = [System.Collections.ArrayList]::new()
+    foreach ($line in $diff) {
+        if ($line -match '^@@') { break }
+        $null = $header.Add($line)
+    }
+
+    return $header
+}
+
+
+# 解析文件的 diff 为 hunk 列表
+# 每个 hunk 包含:
+#   AtHeader    @@ 行
+#   Lines       hunk 的所有 diff 行（- + \ No newline）
+#   AddBytes    +行 UTF-8 字节数
+#   OldStart    旧行起始号（1-based，0 表示新文件）
+#   OldCount    旧行数
+#   NoNewlineOld  旧版本末尾无换行
+#   NoNewlineNew  新版本末尾无换行
+function __GitSplit_ParseHunks {
+    param([string]$FilePath)
+
+    $diff = git diff --cached -U0 -- $FilePath 2>$null
+    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+        return @()
+    }
+
+    $utf8 = [System.Text.Encoding]::UTF8
+    $header = __GitSplit_GetFileDiffHeader -FilePath $FilePath
+    if ($null -eq $header -or $header.Count -eq 0) { return @() }
+
+    $headerLineCount = $header.Count
+    $hunks = [System.Collections.ArrayList]::new()
+    $currentHunkLines = [System.Collections.ArrayList]::new()
+    $currentAtHeader = ""
+    $currentAddBytes = 0
+    $inHunk = $false
+    $lineIndex = 0
+
+    foreach ($line in $diff) {
+        $lineIndex++
+        if ($lineIndex -le $headerLineCount) { continue }
+
+        if ($line -match '^@@') {
+            # 遇到新 @@ 头，保存上一个 hunk
+            if ($inHunk -and $currentHunkLines.Count -gt 0) {
+                $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes))
+            }
+            $currentAtHeader = $line
+            $currentHunkLines = [System.Collections.ArrayList]::new()
+            $currentAddBytes = 0
+            $inHunk = $true
+            continue
+        }
+
+        if ($inHunk) {
+            $null = $currentHunkLines.Add($line)
+            if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
+                $currentAddBytes += $utf8.GetByteCount($line.Substring(1))
+            }
+        }
+    }
+
+    # 保存最后一个 hunk
+    if ($inHunk -and $currentHunkLines.Count -gt 0) {
+        $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes))
+    }
+
+    return $hunks
+}
+
+
+# 从 @@ 头和 diff 行构建 hunk 对象
+function __GitSplit_FinalizeHunk {
+    param([string]$AtHeader, [System.Collections.ArrayList]$Lines, [long]$AddBytes)
+
+    # 解析 @@ -oldStart[,oldCount] +newStart[,newCount] @@
+    $oldStart = 0
+    $oldCount = 0
+    if ($AtHeader -match '^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@') {
+        $oldStart = [int]$Matches[1]
+        $oldCount = if ($Matches[2]) { [int]$Matches[2] } else { 1 }
+    }
+
+    # 检测 \ No newline 标记
+    $noNewlineOld = $false
+    $noNewlineNew = $false
+    $seenPlus = $false
+    foreach ($l in $Lines) {
+        if ($l -match '^\+' -and $l -notmatch '^\+{3}') { $seenPlus = $true }
+        if ($l -match '^\\ No newline') {
+            if ($seenPlus) { $noNewlineNew = $true }
+            else { $noNewlineOld = $true }
+        }
+    }
+
+    return [PSCustomObject]@{
+        AtHeader     = $AtHeader
+        Lines        = $Lines.ToArray()
+        AddBytes     = $AddBytes
+        OldStart     = $oldStart
+        OldCount     = $oldCount
+        NoNewlineOld = $noNewlineOld
+        NoNewlineNew = $noNewlineNew
+    }
+}
+
+
+# 将超限文件按 hunk 贪心分批
+# 每个 hunk batch 包含: FilePath, Hunks, AddBytes
+function __GitSplit_SplitFileByHunks {
+    param(
+        [string]$FilePath,
+        [long]$MaxBytes
+    )
+
+    $hunks = __GitSplit_ParseHunks -FilePath $FilePath
+    if ($null -eq $hunks -or $hunks.Count -eq 0) {
+        return @()
+    }
+
+    $hunkBatches = [System.Collections.ArrayList]::new()
+    $currentHunks = [System.Collections.ArrayList]::new()
+    $currentBytes = 0
+
+    foreach ($hunk in $hunks) {
+        if ($currentHunks.Count -eq 0) {
+            $null = $currentHunks.Add($hunk)
+            $currentBytes = $hunk.AddBytes
+            continue
+        }
+
+        if ($currentBytes + $hunk.AddBytes -le $MaxBytes) {
+            $null = $currentHunks.Add($hunk)
+            $currentBytes += $hunk.AddBytes
+        }
+        else {
+            $null = $hunkBatches.Add([PSCustomObject]@{
+                FilePath = $FilePath
+                Hunks    = $currentHunks.ToArray()
+                AddBytes = $currentBytes
+            })
+            $currentHunks = [System.Collections.ArrayList]::new()
+            $null = $currentHunks.Add($hunk)
+            $currentBytes = $hunk.AddBytes
+        }
+    }
+
+    if ($currentHunks.Count -gt 0) {
+        $null = $hunkBatches.Add([PSCustomObject]@{
+            FilePath = $FilePath
+            Hunks    = $currentHunks.ToArray()
+            AddBytes = $currentBytes
+        })
+    }
+
+    return $hunkBatches
+}
+
+
+# 贪心装箱：将文件列表按字节上限分批
+function __GitSplit_GreedyPack {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$FileList,
+
+        [Parameter(Mandatory)]
+        [long]$MaxBytes
+    )
+
+    if (-not $FileList -or $FileList.Count -eq 0) {
+        return @()
+    }
+
+    $fileBytes = @()
+    foreach ($f in $FileList) {
+        $bytes = __GitSplit_GetFileBytes -FilePath $f
+        $fileBytes += [PSCustomObject]@{
+            Path  = $f
+            Bytes = $bytes
+        }
+    }
+
+    $batches = @()
+    $currentBatch = @()
+    $currentBytes = 0
+
+    foreach ($fb in $fileBytes) {
+        if ($currentBatch.Count -eq 0) {
+            $currentBatch += $fb.Path
+            $currentBytes = $fb.Bytes
+            continue
+        }
+
+        if ($currentBytes + $fb.Bytes -le $MaxBytes) {
+            $currentBatch += $fb.Path
+            $currentBytes += $fb.Bytes
+        }
+        else {
+            $batches += ,@($currentBatch)
+            $currentBatch = @($fb.Path)
+            $currentBytes = $fb.Bytes
+        }
+    }
+
+    if ($currentBatch.Count -gt 0) {
+        $batches += ,@($currentBatch)
+    }
+
+    return ,$batches
+}
+
+
+# 获取暂存区文件的 mode 和 blob hash
+# 返回 @{Status='A'|'M'|'D'; Mode='100644'; Hash='abc123'} 或 $null
+function __GitSplit_GetStagedFileInfo {
+    param([string]$FilePath)
+
+    $statusLine = git diff --cached --name-status -- $FilePath 2>$null
+    if ($null -eq $statusLine -or $statusLine.Count -eq 0) {
+        return $null
+    }
+
+    $statusChar = ($statusLine -split "`t")[0]
+    if ($statusChar.StartsWith('D')) {
+        return @{ Status = 'D'; Mode = $null; Hash = $null; Path = $FilePath }
+    }
+
+    $line = git ls-files -s -- $FilePath 2>$null
+    if ($null -eq $line -or $line.Count -eq 0) {
+        return $null
+    }
+
+    $parts = $line.Trim() -split '\s+'
+    if ($parts.Count -ge 2) {
+        return @{ Status = $statusChar; Mode = $parts[0]; Hash = $parts[1]; Path = $FilePath }
+    }
+    return $null
+}
+
+
+# 获取 HEAD 版本文件内容（原始字节）
+# 使用 .NET Process 避免 PowerShell 编码转换
+function __GitSplit_GetHeadContentBytes {
+    param([string]$FilePath)
+
+    # 检查文件是否在 HEAD 中存在
+    $null = git rev-parse "HEAD:$FilePath" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return [byte[]]@()
+    }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "git"
+    $psi.Arguments = "cat-file -p HEAD:$FilePath"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $process.Start() | Out-Null
+
+    $ms = New-Object System.IO.MemoryStream
+    $process.StandardOutput.BaseStream.CopyTo($ms)
+    $process.WaitForExit()
+
+    $bytes = $ms.ToArray()
+    $ms.Dispose()
+
+    return $bytes
+}
+
+
+# 将 hunk 变更应用到 HEAD 内容，生成中间状态内容
+# 参数:
+#   HeadBytes   HEAD 版本的原始字节
+#   AllHunks    该文件的所有 hunk（按顺序）
+#   UpToIndex   应用 hunk 0..UpToIndex（含）
+# 返回: 应用后的内容字节（UTF-8 无 BOM）
+function __GitSplit_ApplyHunksToContent {
+    param(
+        [byte[]]$HeadBytes,
+        [object[]]$AllHunks,
+        [int]$UpToIndex
+    )
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+
+    # 字节转字符串
+    if ($HeadBytes.Length -eq 0) {
+        $content = ""
+    } else {
+        $content = $utf8NoBom.GetString($HeadBytes)
+    }
+
+    # 判断是否有尾换行
+    $hasTrailingNewline = $content.EndsWith("`n")
+
+    # 统一换行为 LF
+    $content = $content -replace "`r`n", "`n"
+
+    # 去掉尾部换行以便按行处理
+    if ($content.EndsWith("`n")) {
+        $content = $content.Substring(0, $content.Length - 1)
+    }
+
+    # 拆分为行
+    if ([string]::IsNullOrEmpty($content)) {
+        $lines = [System.Collections.ArrayList]::new()
+    } else {
+        $lines = [System.Collections.ArrayList]@($content -split "`n")
+    }
+
+    $offset = 0
+
+    for ($i = 0; $i -le $UpToIndex; $i++) {
+        $hunk = $AllHunks[$i]
+
+        $oldStart = $hunk.OldStart
+        $oldCount = $hunk.OldCount
+
+        # 在当前结果中的位置（0-based）
+        # 新文件 hunk 的 OldStart=0（@@ -0,0 +1,N @@），pos 应为 0
+        if ($oldStart -eq 0) {
+            $pos = 0 + $offset
+        } else {
+            $pos = $oldStart - 1 + $offset
+        }
+
+        # 确保 pos 在有效范围内
+        if ($pos -lt 0) { $pos = 0 }
+        if ($pos -gt $lines.Count) { $pos = $lines.Count }
+
+        # 收集 + 行（新内容）
+        $newLines = [System.Collections.ArrayList]::new()
+        foreach ($line in $hunk.Lines) {
+            if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
+                $null = $newLines.Add($line.Substring(1))
+            }
+        }
+
+        # 删除旧行
+        $removeCount = [Math]::Min($oldCount, [Math]::Max(0, $lines.Count - $pos))
+        if ($removeCount -gt 0) {
+            $lines.RemoveRange($pos, $removeCount)
+        }
+
+        # 插入新行
+        for ($j = 0; $j -lt $newLines.Count; $j++) {
+            $lines.Insert($pos + $j, $newLines[$j])
+        }
+
+        # 更新偏移
+        $offset += ($newLines.Count - $oldCount)
+
+        # 追踪尾换行状态
+        if ($hunk.NoNewlineNew) {
+            $hasTrailingNewline = $false
+        } elseif ($hunk.NoNewlineOld) {
+            $hasTrailingNewline = $true
+        } elseif ($HeadBytes.Length -eq 0 -and $newLines.Count -gt 0) {
+            # 新文件且有 + 行，默认有尾换行（除非 NoNewlineNew 已处理）
+            $hasTrailingNewline = $true
+        }
+    }
+
+    # 重建内容
+    $result = $lines -join "`n"
+    if ($hasTrailingNewline -and $lines.Count -gt 0) {
+        $result += "`n"
+    }
+
+    return $utf8NoBom.GetBytes($result)
+}
+
+
+# 临时文件路径管理
+function __GitSplit_GetTempDir {
+    $repoRoot = git rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
+        return $env:TEMP
+    }
+    $tmpDir = Join-Path $repoRoot "keep_local\.git-split-tmp"
+    if (-not (Test-Path $tmpDir)) {
+        $null = New-Item -ItemType Directory -Path $tmpDir -Force
+    }
+    return $tmpDir
+}
+
+function __GitSplit_GetTempFile {
+    param([string]$Suffix = "patch")
+
+    $tmpDir = __GitSplit_GetTempDir
+    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
+    $mypid = $PID
+    $rnd = Get-Random -Maximum 9999
+    $fileName = "split-$mypid-$ts-$rnd.$Suffix"
+    return Join-Path $tmpDir $fileName
+}
+
+# 清理临时目录中超过 1 天的残留文件
+function __GitSplit_CleanStaleTemp {
+    $tmpDir = __GitSplit_GetTempDir
+    if (-not (Test-Path $tmpDir)) { return }
+
+    $cutoff = (Get-Date).AddDays(-1)
+    Get-ChildItem $tmpDir -Filter "split-*" | Where-Object {
+        $_.LastWriteTime -lt $cutoff
+    } | ForEach-Object {
+        Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+
+# 帮助请求拦截
 function __GitSplit_HelpInterceptor {
     param(
         [string]$CommandName,
@@ -119,86 +575,26 @@ function __GitSplit_WriteHeader {
 }
 
 
-# 贪心装箱：将文件列表按字节上限分批
-# 返回二维数组，每个元素是一个文件路径数组
-function __GitSplit_GreedyPack {
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$FileList,
-
-        [Parameter(Mandatory)]
-        [long]$MaxBytes
-    )
-
-    if (-not $FileList -or $FileList.Count -eq 0) {
-        return @()
-    }
-
-    # 先计算每个文件的字节数
-    $fileBytes = @()
-    foreach ($f in $FileList) {
-        $bytes = __GitSplit_GetFileBytes -FilePath $f
-        $fileBytes += [PSCustomObject]@{
-            Path  = $f
-            Bytes = $bytes
-        }
-    }
-
-    # 贪心装箱
-    $batches = @()
-    $currentBatch = @()
-    $currentBytes = 0
-
-    foreach ($fb in $fileBytes) {
-        # 当前批为空 → 直接放入（即使超上限也独立成批）
-        if ($currentBatch.Count -eq 0) {
-            $currentBatch += $fb.Path
-            $currentBytes = $fb.Bytes
-            continue
-        }
-
-        # 加入后不超上限 → 放入当前批
-        if ($currentBytes + $fb.Bytes -le $MaxBytes) {
-            $currentBatch += $fb.Path
-            $currentBytes += $fb.Bytes
-        }
-        else {
-            # 超上限 → 封装当前批，新开一批
-            $batches += ,@($currentBatch)
-            $currentBatch = @($fb.Path)
-            $currentBytes = $fb.Bytes
-        }
-    }
-
-    # 封装最后一批
-    if ($currentBatch.Count -gt 0) {
-        $batches += ,@($currentBatch)
-    }
-
-    return ,$batches
-}
-
-
 # ============================================================
 # 主函数: Split-GitStagedCommit
 # ============================================================
 function Split-GitStagedCommit {
     <#
     .SYNOPSIS
-        将暂存区按字节大小拆分为多个提交
+        将暂存区按字节大小拆分为多个提交（支持 hunk 级切分）
     .DESCRIPTION
         获取暂存区所有文件，按 UTF-8 新增字节贪心分批，
         每批不超过 -MaxBytes 指定的上限，提交注释自动追加 #序号。
+        超限文件自动按 hunk 切分，分多次提交。
 
-        执行前会先 git reset 清空暂存区，再逐批 git add + commit。
+        所有操作仅针对暂存区，不修改工作区文件，
+        未暂存改动全程保留，无需 stash。
+        执行前保存完整 diff 到临时文件，出错可恢复。
+
         不会执行 git push。
-
-        -DryRun → 仅模拟分批结果，不执行实际提交
-        -Help   → 显示完整帮助
     .EXAMPLE
         Split-GitStagedCommit -MaxBytes 10240 -Message "feature: 新增模块"
-        Split-GitStagedCommit -MaxBytes 5KB -Message "feat" -DryRun
+        Split-GitStagedCommit -MaxBytes 5120 -Message "feat" -DryRun
         Split-GitStagedCommit -MaxBytes 10000 -Message "refactor" -Help
     #>
     [CmdletBinding()]
@@ -227,6 +623,9 @@ function Split-GitStagedCommit {
         return
     }
 
+    # 清理过期临时文件
+    __GitSplit_CleanStaleTemp
+
     # 获取暂存区文件列表
     $stagedFiles = git diff --cached --name-only
     if ($null -eq $stagedFiles -or $stagedFiles.Count -eq 0) {
@@ -234,6 +633,12 @@ function Split-GitStagedCommit {
         return
     }
     $stagedFiles = @($stagedFiles)
+
+    # 保存暂存区文件信息（mode + blob hash），reset 后需要
+    $stagedInfo = @{}
+    foreach ($f in $stagedFiles) {
+        $stagedInfo[$f] = __GitSplit_GetStagedFileInfo -FilePath $f
+    }
 
     Write-Host ""
     Write-Host "暂存区共 $($stagedFiles.Count) 个文件，字节上限: $MaxBytes" -ForegroundColor Cyan
@@ -248,76 +653,193 @@ function Split-GitStagedCommit {
         return
     }
 
-    # 打印分批预览
-    __GitSplit_WriteHeader -Title "分批预览（共 $($batches.Count) 批）" -Color Cyan
+    # ---- 构建提交计划 ----
+    $commitPlan = [System.Collections.ArrayList]::new()
+    $seq = 0
 
-    $totalBytes = 0
     for ($i = 0; $i -lt $batches.Count; $i++) {
         $batch = $batches[$i]
         $batchBytes = 0
         foreach ($f in $batch) {
             $batchBytes += __GitSplit_GetFileBytes -FilePath $f
         }
-        $totalBytes += $batchBytes
 
-        $seq = $i + 1
-        Write-Host "  批次 $seq / $($batches.Count) — 提交注释: $Message #$seq" -ForegroundColor Yellow
-        Write-Host "  文件数: $($batch.Count)    字节: $batchBytes" -ForegroundColor Gray
-        foreach ($f in $batch) {
-            $fb = __GitSplit_GetFileBytes -FilePath $f
-            Write-Host "    $f  ($fb bytes)" -ForegroundColor DarkGray
+        if ($batchBytes -le $MaxBytes) {
+            # 整文件批次
+            $fileInfos = [System.Collections.ArrayList]::new()
+            foreach ($f in $batch) {
+                $info = $stagedInfo[$f]
+                if ($null -ne $info) {
+                    $null = $fileInfos.Add($info)
+                }
+            }
+            $seq++
+            $null = $commitPlan.Add([PSCustomObject]@{
+                Type      = 'files'
+                Files     = @($batch)
+                FileInfos = $fileInfos.ToArray()
+                Bytes     = $batchBytes
+                Seq       = $seq
+                CommitMsg = "$Message #$seq"
+            })
         }
-        Write-Host ""
+        else {
+            # 超限文件需逐个处理
+            foreach ($f in $batch) {
+                $fileBytes = __GitSplit_GetFileBytes -FilePath $f
+
+                if ($fileBytes -le $MaxBytes) {
+                    $seq++
+                    $null = $commitPlan.Add([PSCustomObject]@{
+                        Type      = 'files'
+                        Files     = @($f)
+                        FileInfos = @($stagedInfo[$f])
+                        Bytes     = $fileBytes
+                        Seq       = $seq
+                        CommitMsg = "$Message #$seq"
+                    })
+                    continue
+                }
+
+                # 文件超限
+                if (__GitSplit_IsBinaryFile -FilePath $f) {
+                    $seq++
+                    $null = $commitPlan.Add([PSCustomObject]@{
+                        Type      = 'files'
+                        Files     = @($f)
+                        FileInfos = @($stagedInfo[$f])
+                        Bytes     = $fileBytes
+                        Seq       = $seq
+                        CommitMsg = "$Message #$seq"
+                        Note      = "二进制文件，无法按 hunk 切分，独立提交"
+                    })
+                    continue
+                }
+
+                # 按 hunk 切分
+                $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes
+                $allHunks = __GitSplit_ParseHunks -FilePath $f
+                $hunkIdx = 0
+                foreach ($hb in $hunkBatches) {
+                    $hunkIdx += $hb.Hunks.Count
+                    $seq++
+                    $null = $commitPlan.Add([PSCustomObject]@{
+                        Type      = 'hunks'
+                        FilePath  = $f
+                        Mode      = $stagedInfo[$f].Mode
+                        AllHunks  = $allHunks
+                        UpToIndex = $hunkIdx - 1
+                        Hunks     = $hb.Hunks
+                        Bytes     = $hb.AddBytes
+                        Seq       = $seq
+                        CommitMsg = "$Message #$seq"
+                        Note      = "hunk 切分"
+                    })
+                }
+            }
+        }
     }
 
-    Write-Host "  总计: $($stagedFiles.Count) 个文件, $totalBytes 字节, $($batches.Count) 批" -ForegroundColor Green
+    # ---- 打印分批预览 ----
+    __GitSplit_WriteHeader -Title "提交计划（共 $($commitPlan.Count) 批）" -Color Cyan
+
+    $totalBytes = 0
+    foreach ($item in $commitPlan) {
+        Write-Host "  批次 $($item.Seq) / $($commitPlan.Count)  提交注释: $($item.CommitMsg)" -ForegroundColor Yellow
+        Write-Host "  字节: $($item.Bytes)" -ForegroundColor Gray
+        if ($item.Type -eq 'files') {
+            Write-Host "  文件数: $($item.Files.Count)" -ForegroundColor Gray
+            foreach ($f in $item.Files) {
+                $fb = __GitSplit_GetFileBytes -FilePath $f
+                Write-Host "    $f  ($fb bytes)" -ForegroundColor DarkGray
+            }
+        }
+        else {
+            $hunkCount = $item.Hunks.Count
+            Write-Host "  文件: $($item.FilePath)  [hunk 切分, $hunkCount 个 hunk]" -ForegroundColor Gray
+        }
+        if ($item.Note) {
+            Write-Host "  备注: $($item.Note)" -ForegroundColor Magenta
+        }
+        Write-Host ""
+        $totalBytes += $item.Bytes
+    }
+
+    Write-Host "  总计: $($stagedFiles.Count) 个文件, $totalBytes 字节, $($commitPlan.Count) 批" -ForegroundColor Green
     Write-Host ""
 
-    # ---- DryRun 模式: 到此为止 ----
+    # ---- DryRun 模式 ----
     if ($DryRun) {
-        Write-Host "DryRun 模式：未执行任何 git 操作" -ForegroundColor Yellow
+        Write-Host "DryRun 模式：未执行任何 git 操作，暂存区未修改" -ForegroundColor Yellow
         return
     }
 
     # ---- 实际执行 ----
     __GitSplit_WriteHeader -Title "开始提交" -Color Green
 
-    # 先保存原始暂存区文件列表（git reset 后需要重新 add）
-    # git reset 会清空暂存区，但不影响工作区文件内容
+    # 保存完整暂存区 diff 到临时文件（安全网，出错时可恢复）
+    $backupFile = __GitSplit_GetTempFile -Suffix "backup.patch"
+    Write-Host "  保存暂存区 diff 到: $backupFile" -ForegroundColor Cyan
+    $backupBytes = __GitSplit_GetAllStagedDiffBytes
+    if ($null -ne $backupBytes -and $backupBytes.Count -gt 0) {
+        [System.IO.File]::WriteAllBytes($backupFile, $backupBytes)
+        Write-Host "  备份完成 ($($backupBytes.Count) bytes)" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "  备份失败，继续执行（无安全网）" -ForegroundColor Yellow
+        $backupFile = $null
+    }
 
     # 清空暂存区
-    git reset 2>$null | Out-Null
+    Write-Host "  清空暂存区（不修改工作区）..." -ForegroundColor Cyan
+    git reset -q 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  git reset 失败" -ForegroundColor Red
+        return
+    }
 
     $successCount = 0
     $failCount = 0
+    $anyFail = $false
 
-    for ($i = 0; $i -lt $batches.Count; $i++) {
-        $batch = $batches[$i]
-        $seq = $i + 1
-        $commitMsg = "$Message #$seq"
+    for ($i = 0; $i -lt $commitPlan.Count; $i++) {
+        $item = $commitPlan[$i]
 
-        Write-Host "  [$seq/$($batches.Count)] 提交: $commitMsg" -ForegroundColor Yellow
-        Write-Host "    文件: $($batch.Count) 个" -ForegroundColor Gray
+        Write-Host "  [$($item.Seq)/$($commitPlan.Count)] 提交: $($item.CommitMsg)" -ForegroundColor Yellow
+        Write-Host "    字节: $($item.Bytes)" -ForegroundColor Gray
 
-        # 逐个 add
-        foreach ($f in $batch) {
-            git add -- $f 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "    git add 失败: $f" -ForegroundColor Red
-            }
+        $success = $false
+
+        if ($item.Type -eq 'files') {
+            Write-Host "    文件: $($item.Files.Count) 个" -ForegroundColor Gray
+            $success = __GitSplit_CommitFiles -FileInfos $item.FileInfos -CommitMsg $item.CommitMsg
+        }
+        else {
+            Write-Host "    文件: $($item.FilePath)  [hunk 切分, $($item.Hunks.Count) hunk]" -ForegroundColor Gray
+            $success = __GitSplit_CommitHunks -FilePath $item.FilePath -Mode $item.Mode -AllHunks $item.AllHunks -UpToIndex $item.UpToIndex -CommitMsg $item.CommitMsg
         }
 
-        # commit
-        $commitResult = git commit -m $commitMsg 2>&1
-        if ($LASTEXITCODE -eq 0) {
+        if ($success) {
             Write-Host "    提交成功" -ForegroundColor Green
             $successCount++
         }
         else {
-            Write-Host "    提交失败: $commitResult" -ForegroundColor Red
+            Write-Host "    提交失败" -ForegroundColor Red
             $failCount++
+            $anyFail = $true
         }
         Write-Host ""
+    }
+
+    # 清理临时文件
+    if ($null -ne $backupFile -and -not $anyFail) {
+        Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
+        Write-Host "  备份文件已清理" -ForegroundColor DarkGray
+    }
+    elseif ($anyFail -and $null -ne $backupFile -and (Test-Path $backupFile)) {
+        Write-Host "  有提交失败，备份文件保留: $backupFile" -ForegroundColor Yellow
+        Write-Host "  可用以下命令恢复暂存区:" -ForegroundColor Yellow
+        Write-Host "    git apply --cached `"$backupFile`"" -ForegroundColor White
     }
 
     # 汇总
@@ -328,6 +850,99 @@ function Split-GitStagedCommit {
     }
     Write-Host "  未执行 git push，请手动推送" -ForegroundColor Yellow
     Write-Host ""
+}
+
+
+# 获取完整暂存区 diff 的字节数组（用于备份恢复）
+function __GitSplit_GetAllStagedDiffBytes {
+    $diff = git diff --cached 2>$null
+    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+        return $null
+    }
+
+    $patchText = $diff -join "`n"
+    $patchText += "`n"
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    return $utf8NoBom.GetBytes($patchText)
+}
+
+
+# 整文件提交：用 blob hash + update-index 恢复到暂存区，然后 commit
+function __GitSplit_CommitFiles {
+    param(
+        [object[]]$FileInfos,
+        [string]$CommitMsg
+    )
+
+    foreach ($info in $FileInfos) {
+        if ($info.Status -eq 'D') {
+            # 删除文件
+            git rm --cached -- $info.Path 2>$null
+        } else {
+            # 新增/修改文件
+            git update-index --add --cacheinfo "$($info.Mode),$($info.Hash),$($info.Path)" 2>$null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    git update-index/rm 失败: $($info.Path)" -ForegroundColor Red
+            return $false
+        }
+    }
+
+    $result = git commit -m $CommitMsg 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        return $true
+    } else {
+        Write-Host "    git commit 失败: $result" -ForegroundColor Red
+        return $false
+    }
+}
+
+
+# Hunk 切分提交：重建中间内容 → hash-object → update-index → commit
+function __GitSplit_CommitHunks {
+    param(
+        [string]$FilePath,
+        [string]$Mode,
+        [object[]]$AllHunks,
+        [int]$UpToIndex,
+        [string]$CommitMsg
+    )
+
+    # 获取 HEAD 内容字节
+    $headBytes = __GitSplit_GetHeadContentBytes -FilePath $FilePath
+
+    # 应用 hunk 变更，生成中间内容
+    $contentBytes = __GitSplit_ApplyHunksToContent -HeadBytes $headBytes -AllHunks $AllHunks -UpToIndex $UpToIndex
+
+    # 写入临时文件
+    $tempFile = __GitSplit_GetTempFile -Suffix "content.bin"
+    [System.IO.File]::WriteAllBytes($tempFile, $contentBytes)
+
+    # 创建 blob
+    $blobHash = git hash-object -w $tempFile 2>$null
+    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($blobHash)) {
+        Write-Host "    git hash-object 失败" -ForegroundColor Red
+        return $false
+    }
+
+    # 更新暂存区
+    git update-index --add --cacheinfo "$Mode,$blobHash,$FilePath" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    git update-index 失败" -ForegroundColor Red
+        return $false
+    }
+
+    # 提交
+    $result = git commit -m $CommitMsg 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        return $true
+    } else {
+        Write-Host "    git commit 失败: $result" -ForegroundColor Red
+        return $false
+    }
 }
 
 
