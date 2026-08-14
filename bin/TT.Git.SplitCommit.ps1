@@ -22,10 +22,10 @@
       - 所有操作仅针对暂存区，不修改工作区文件
       - git commit 只提交暂存区内容，工作区改动不受影响
       - 无需 stash，无需 stash pop
-      - 执行前保存完整 diff 到 .git/split-tmp/，出错可恢复
+      - 执行前保存完整 diff 到 .git/TT.ToolKit/split-tmp/，出错可恢复
 
     临时文件:
-      - 临时文件存放在 .git/split-tmp/（Git 内部目录，天然被忽略）
+      - 临时文件存放在 .git/TT.ToolKit/split-tmp/（Git 内部目录，天然被忽略）
       - 文件名含 PID 和时间戳，防止并发冲突
       - 正常完成后自动清理；异常退出时保留，可用于手动恢复
 
@@ -524,8 +524,8 @@ function __GitSplit_GetTempDir {
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
         return $env:TEMP
     }
-    # 使用 .git/split-tmp/ —— Git 内部目录，天然被忽略，不依赖项目 .gitignore
-    $gitDir = Join-Path $repoRoot ".git\split-tmp"
+    # 使用 .git/TT.ToolKit/split-tmp/ —— Git 内部目录，天然被忽略，不依赖项目 .gitignore
+    $gitDir = Join-Path $repoRoot ".git\TT.ToolKit\split-tmp"
     if (-not (Test-Path $gitDir)) {
         $null = New-Item -ItemType Directory -Path $gitDir -Force
     }
@@ -553,6 +553,24 @@ function __GitSplit_CleanStaleTemp {
         $_.LastWriteTime -lt $cutoff
     } | ForEach-Object {
         Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# 清理空的临时目录：split-tmp/ 为空则删除，TT.ToolKit/ 为空也删除
+function __GitSplit_CleanEmptyTempDirs {
+    $repoRoot = git rev-parse --show-toplevel 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) { return }
+
+    $splitTmp = Join-Path $repoRoot ".git\TT.ToolKit\split-tmp"
+    $toolKit  = Join-Path $repoRoot ".git\TT.ToolKit"
+
+    # split-tmp 为空则删除
+    if ((Test-Path $splitTmp) -and (Get-ChildItem $splitTmp -ErrorAction SilentlyContinue).Count -eq 0) {
+        Remove-Item $splitTmp -Force -ErrorAction SilentlyContinue
+    }
+    # TT.ToolKit 为空则删除（可能被其他脚本共享，只删空目录不影响）
+    if ((Test-Path $toolKit) -and (Get-ChildItem $toolKit -ErrorAction SilentlyContinue).Count -eq 0) {
+        Remove-Item $toolKit -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -857,12 +875,15 @@ function Split-GitStagedCommit {
         Write-Host ""
     }
 
-    # 清理临时文件
+    # 清理临时文件和空目录
     if ($null -ne $backupFile -and -not $anyFail) {
         Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
         Write-Host "  备份文件已清理" -ForegroundColor DarkGray
     }
-    elseif ($anyFail) {
+    # 尝试清理空的临时目录（目录为空则删除，有文件则保留）
+    __GitSplit_CleanEmptyTempDirs
+
+    if ($anyFail) {
         Write-Host "  有提交失败！" -ForegroundColor Red
         # 用 stagedInfo 恢复剩余未提交文件到暂存区
         $remainingFiles = @()
