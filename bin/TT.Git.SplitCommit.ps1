@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Git 暂存区拆分提交工具 - 按字节大小自动分批提交（支持 hunk 级切分）
+    Git 暂存区拆分提交工具 - 按字节大小自动分批提交（支持 hunk 级及行级切分）
 .DESCRIPTION
     将当前暂存区（staged）的变更按 UTF-8 字节大小拆分为多个提交，
     每个提交不超过指定字节上限。提交注释自动追加序号后缀。
@@ -13,7 +13,14 @@
       2. 逐文件计算 UTF-8 新增字节数
       3. 贪心装箱：累加文件字节，不超过 MaxBytes 则放入当前批，否则新开一批
       4. 超限文件自动按 hunk 切分，分多次提交
-      5. 逐批提交：整文件用 blob hash + update-index，hunk 切分用 hash-object + update-index
+      5. 单个 hunk 超限时，在 hunk 内部按 +行 贪心拆分为多个子 hunk
+      6. 逐批提交：整文件用 blob hash + update-index，hunk 切分用 hash-object + update-index
+
+    行级切分规则:
+      - 修改型 hunk：第一个子 hunk 保留 - 行（完成删除），后续子 hunk OldCount=0（纯插入）
+      - 新增型 hunk：直接按 +行 分组
+      - \ No newline at end of file 只附在最后一个子 hunk
+      - 拆分后的子 hunk 无缝接入现有 hunk 提交流程
 
     参数说明:
       -MaxBytes    → 每个提交的字节上限（必填，单位：字节）
@@ -36,6 +43,7 @@
       - 操作对象仅为暂存区（staged），不涉及工作区未跟踪文件
       - 不会执行 git push，仅本地提交
       - 单个文件字节超上限时，自动按 hunk 切分多次提交
+      - 单个 hunk 也超限时，在 hunk 内部按 +行 贪心拆分（行级切分）
       - 二进制文件无法切分，超限时独立成一批提交
       - 支持新增文件和修改已有文件
 .NOTES
@@ -382,8 +390,190 @@ function __GitSplit_FinalizeHunk {
 }
 
 
+# 将超限的单个 hunk 按 +行 贪心拆分为多个子 hunk
+# 参数:
+#   Hunk      待拆分的 hunk 对象（来自 __GitSplit_ParseHunks / __GitSplit_FinalizeHunk）
+#   MaxBytes  每个子 hunk 的字节上限
+# 返回: 子 hunk 数组（每个子 hunk 都是标准的 hunk 对象）
+#
+# 拆分规则:
+#   - 修改型 hunk（OldCount > 0）: 第一个子 hunk 保留 - 行（完成删除），后续子 hunk
+#     的 OldCount=0（纯插入，不需要先删除旧行）
+#   - 新增型 hunk（OldStart=0）: 直接按 +行 分组
+#   - 每个子 hunk 生成自己的 @@ 头
+#   - \ No newline at end of file 只附在最后一个子 hunk
+#
+# 重要：后续子 hunk 的 OldStart 基于"前一个子 hunk 提交后的 HEAD 行号"计算，
+# 而非原始 hunk 的旧行号。这是因为每次提交后 HEAD 已经改变，
+# 后续子 hunk 必须基于新的 HEAD 定位插入位置。
+#
+# 具体计算:
+#   - 第一个子 hunk: OldStart = 原始 oldStart, OldCount = 原始 oldCount
+#   - 第 k 个子 hunk (k>0): OldStart = 原始 oldStart + sum(前 k 个子 hunk 的 +行数) - 1
+#     （因为第一个子 hunk 删除了 oldCount 行并插入了 N1 行，
+#       HEAD 中该区域变成了 N1 行，所以下一个插入点在第 N1 行之后）
+function __GitSplit_SplitSingleHunk {
+    param(
+        [object]$Hunk,
+        [long]$MaxBytes
+    )
+
+    $utf8 = [System.Text.Encoding]::UTF8
+
+    # 提取 + 行及其字节数
+    $addLines = [System.Collections.ArrayList]::new()
+    $addLineBytes = [System.Collections.ArrayList]::new()
+    foreach ($line in $Hunk.Lines) {
+        if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
+            $content = $line.Substring(1)
+            $null = $addLines.Add($content)
+            $null = $addLineBytes.Add($utf8.GetByteCount($content))
+        }
+    }
+
+    # 提取 - 行（仅第一个子 hunk 需要）
+    $removeLines = [System.Collections.ArrayList]::new()
+    foreach ($line in $Hunk.Lines) {
+        if ($line -match '^-' -and $line -notmatch '^-{3}') {
+            $null = $removeLines.Add($line.Substring(1))
+        }
+    }
+
+    # 如果 + 行数 <= 1，无法再拆分，直接返回原 hunk
+    if ($addLines.Count -le 1) {
+        return @($Hunk)
+    }
+
+    # 贪心分组：将 + 行按 MaxBytes 分成多组
+    # 每组: @{ StartIndex, Count, Bytes }
+    $groups = [System.Collections.ArrayList]::new()
+    $gStart = 0
+    $gBytes = 0
+
+    for ($i = 0; $i -lt $addLines.Count; $i++) {
+        $lb = $addLineBytes[$i]
+        if ($gStart -eq $i) {
+            # 当前组的第一行，必须放入（即使超限）
+            $gBytes = $lb
+        }
+        elseif ($gBytes + $lb -le $MaxBytes) {
+            $gBytes += $lb
+        }
+        else {
+            # 结束当前组，开新组
+            $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $i - $gStart; Bytes = $gBytes })
+            $gStart = $i
+            $gBytes = $lb
+        }
+    }
+    # 最后一组
+    if ($gStart -lt $addLines.Count) {
+        $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $addLines.Count - $gStart; Bytes = $gBytes })
+    }
+
+    # 只分出1组 → 无需拆分
+    if ($groups.Count -le 1) {
+        return @($Hunk)
+    }
+
+    # 解析原始 @@ 头中的 OldStart / OldCount
+    $oldStart = $Hunk.OldStart
+    $oldCount = $Hunk.OldCount
+
+    # 构建子 hunk 列表
+    $subHunks = [System.Collections.ArrayList]::new()
+
+    for ($gi = 0; $gi -lt $groups.Count; $gi++) {
+        $g = $groups[$gi]
+        $subLines = [System.Collections.ArrayList]::new()
+        $subAddBytes = 0
+
+        if ($gi -eq 0 -and $removeLines.Count -gt 0) {
+            # 第一个子 hunk：包含 - 行（删除旧行），然后是第一组 + 行
+            foreach ($rl in $removeLines) {
+                $null = $subLines.Add("-$rl")
+            }
+        }
+
+        # 添加本组的 + 行
+        for ($j = $g.StartIndex; $j -lt $g.StartIndex + $g.Count; $j++) {
+            $null = $subLines.Add("+$($addLines[$j])")
+            $subAddBytes += $addLineBytes[$j]
+        }
+
+        # \ No newline 标记处理
+        if ($gi -eq $groups.Count - 1 -and $Hunk.NoNewlineNew) {
+            $null = $subLines.Add('\ No newline at end of file')
+        }
+        if ($gi -eq 0 -and $groups.Count -gt 1 -and $Hunk.NoNewlineOld) {
+            $null = $subLines.Add('\ No newline at end of file')
+        }
+
+        # 构造 @@ 头
+        # 后续子 hunk 的 OldStart 基于前一个子 hunk 提交后的 HEAD 行号：
+        #   第一个子 hunk 提交后，原区域变成 N1 行（第一组+行数），
+        #   所以第二个子 hunk 应在 oldStart-1+N1 位置之后插入，
+        #   即 OldStart = oldStart - 1 + N1 + 1 = oldStart + N1
+        if ($gi -eq 0) {
+            $subOldStart = $oldStart
+            $subOldCount = $oldCount
+        }
+        else {
+            # 计算前面所有子 hunk 的 +行总数
+            $prevAddLines = 0
+            for ($pk = 0; $pk -lt $gi; $pk++) {
+                $prevAddLines += $groups[$pk].Count
+            }
+            $subOldStart = $oldStart + $prevAddLines
+            $subOldCount = 0
+        }
+        $subNewCount = $g.Count
+
+        # 计算 NewStart
+        if ($gi -eq 0) {
+            $subNewStart = $oldStart
+        }
+        else {
+            $prevAddLines2 = 0
+            for ($pk = 0; $pk -lt $gi; $pk++) {
+                $prevAddLines2 += $groups[$pk].Count
+            }
+            $subNewStart = $oldStart + $prevAddLines2
+        }
+
+        # 构造 @@ 头字符串
+        if ($subOldCount -eq 0) {
+            if ($subOldStart -eq 0) {
+                $atHeader = "@@ -0,0 +$subNewStart,$subNewCount @@"
+            }
+            else {
+                $atHeader = "@@ -$subOldStart +$subNewStart,$subNewCount @@"
+            }
+        }
+        else {
+            $atHeader = "@@ -$subOldStart,$subOldCount +$subNewStart,$subNewCount @@"
+        }
+
+        $subHunk = [PSCustomObject]@{
+            AtHeader     = $atHeader
+            Lines        = $subLines.ToArray()
+            AddBytes     = $subAddBytes
+            OldStart     = $subOldStart
+            OldCount     = $subOldCount
+            NoNewlineOld = ($gi -eq 0 -and $Hunk.NoNewlineOld -and $groups.Count -gt 1)
+            NoNewlineNew = ($gi -eq $groups.Count - 1 -and $Hunk.NoNewlineNew)
+        }
+
+        $null = $subHunks.Add($subHunk)
+    }
+
+    return $subHunks.ToArray()
+}
+
+
 # 将超限文件按 hunk 贪心分批
 # 每个 hunk batch 包含: FilePath, Hunks, AddBytes
+# 对超限的单个 hunk，调用 __GitSplit_SplitSingleHunk 按行拆分
 function __GitSplit_SplitFileByHunks {
     param(
         [string]$FilePath,
@@ -395,11 +585,26 @@ function __GitSplit_SplitFileByHunks {
         return @()
     }
 
+    # 对超限的单个 hunk 按行拆分
+    $expandedHunks = [System.Collections.ArrayList]::new()
+    foreach ($hunk in $hunks) {
+        if ($hunk.AddBytes -gt $MaxBytes) {
+            $subHunks = __GitSplit_SplitSingleHunk -Hunk $hunk -MaxBytes $MaxBytes
+            foreach ($sh in $subHunks) {
+                $null = $expandedHunks.Add($sh)
+            }
+        }
+        else {
+            $null = $expandedHunks.Add($hunk)
+        }
+    }
+
+    # 用展开后的 hunk 列表进行贪心分批
     $hunkBatches = [System.Collections.ArrayList]::new()
     $currentHunks = [System.Collections.ArrayList]::new()
     $currentBytes = 0
 
-    foreach ($hunk in $hunks) {
+    foreach ($hunk in $expandedHunks) {
         if ($currentHunks.Count -eq 0) {
             $null = $currentHunks.Add($hunk)
             $currentBytes = $hunk.AddBytes
@@ -587,8 +792,13 @@ function __GitSplit_ApplyHunksToContent {
 
         # 在当前结果中的位置（0-based）
         # 新文件 hunk 的 OldStart=0（@@ -0,0 +1,N @@），pos 应为 0
+        # OldCount=0 的纯插入 hunk：OldStart 表示"在第 OldStart 行之后插入"，pos = OldStart + offset
+        # OldCount>0 的替换 hunk：pos = OldStart - 1 + offset（0-based 起始位置）
         if ($oldStart -eq 0) {
             $pos = 0 + $offset
+        } elseif ($oldCount -eq 0) {
+            # 纯插入：在第 oldStart 行之后插入，0-based 就是 oldStart
+            $pos = $oldStart + $offset
         } else {
             $pos = $oldStart - 1 + $offset
         }
@@ -727,11 +937,12 @@ function __GitSplit_WriteHeader {
 function Split-GitStagedCommit {
     <#
     .SYNOPSIS
-        将暂存区按字节大小拆分为多个提交（支持 hunk 级切分）
+        将暂存区按字节大小拆分为多个提交（支持 hunk 级及行级切分）
     .DESCRIPTION
         获取暂存区所有文件，按 UTF-8 新增字节贪心分批，
         每批不超过 -MaxBytes 指定的上限，提交注释自动追加 #序号。
         超限文件自动按 hunk 切分，分多次提交。
+        单个 hunk 超限时，在 hunk 内部按 +行 贪心拆分为多个子 hunk（行级切分）。
 
         所有操作仅针对暂存区，不修改工作区文件，
         未暂存改动全程保留，无需 stash。
@@ -883,13 +1094,12 @@ function Split-GitStagedCommit {
                     continue
                 }
 
-                # 按 hunk 切分
+                # 按 hunk 切分（含单 hunk 内按行切分）
                 $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes
-                $allHunks = __GitSplit_ParseHunks -FilePath $f
                 $fMode = if ($null -ne $stagedInfo[$f]) { $stagedInfo[$f].Mode } else { '100644' }
 
-                # 只有1批 → 实际未切分，按整文件提交
-                if ($hunkBatches.Count -le 1) {
+                if ($hunkBatches.Count -le 1 -and $hunkBatches[0].Hunks.Count -le 1) {
+                    # 拆分后仍然只有 1 个 hunk（无法再拆的单行或已合规）
                     $seq++
                     $null = $commitPlan.Add([PSCustomObject]@{
                         Type      = 'files'
@@ -898,10 +1108,12 @@ function Split-GitStagedCommit {
                         Bytes     = $fileBytes
                         Seq       = $seq
                         CommitMsg = "$Message #$seq"
-                        Note      = "超限但仅1个hunk，整文件提交"
+                        Note      = "超限但仅1个hunk/子hunk，整文件提交"
                     })
                 }
                 else {
+                    # 增量提交模式：每个批次只包含当前批次需要应用的 hunk
+                    # CommitHunks 从当前 HEAD 开始，只应用本批次的 hunk（而非累积 AllHunks）
                     $hunkIdx = 0
                     foreach ($hb in $hunkBatches) {
                         $hunkIdx += $hb.Hunks.Count
@@ -910,13 +1122,11 @@ function Split-GitStagedCommit {
                             Type      = 'hunks'
                             FilePath  = $f
                             Mode      = $fMode
-                            AllHunks  = $allHunks
-                            UpToIndex = $hunkIdx - 1
                             Hunks     = $hb.Hunks
                             Bytes     = $hb.AddBytes
                             Seq       = $seq
                             CommitMsg = "$Message #$seq"
-                            Note      = "hunk 切分为 $($hunkBatches.Count) 批"
+                            Note      = "hunk 切分为 $($hunkBatches.Count) 批（含行切分）"
                         })
                     }
                 }
@@ -1000,7 +1210,7 @@ function Split-GitStagedCommit {
         }
         else {
             Write-Host "    文件: $($item.FilePath)  [hunk 切分, $($item.Hunks.Count) hunk]" -ForegroundColor Gray
-            $success = __GitSplit_CommitHunks -FilePath $item.FilePath -Mode $item.Mode -AllHunks $item.AllHunks -UpToIndex $item.UpToIndex -CommitMsg $item.CommitMsg
+            $success = __GitSplit_CommitHunks -FilePath $item.FilePath -Mode $item.Mode -Hunks $item.Hunks -CommitMsg $item.CommitMsg
         }
 
         if ($success) {
@@ -1109,21 +1319,23 @@ function __GitSplit_CommitFiles {
 }
 
 
-# Hunk 切分提交：重建中间内容 → hash-object → update-index → commit
+# Hunk 切分提交（增量模式）：从当前 HEAD 应用当前批次的 hunk，生成中间内容后提交
+# 每次只接收当前批次需要应用的 hunk 列表，从当前 HEAD 内容开始应用
+# 这样每次提交后 HEAD 更新，下一次调用自然基于新的 HEAD
 function __GitSplit_CommitHunks {
     param(
         [string]$FilePath,
         [string]$Mode,
-        [object[]]$AllHunks,
-        [int]$UpToIndex,
+        [object[]]$Hunks,
         [string]$CommitMsg
     )
 
-    # 获取 HEAD 内容字节
+    # 获取当前 HEAD 内容字节
     $headBytes = __GitSplit_GetHeadContentBytes -FilePath $FilePath
 
-    # 应用 hunk 变更，生成中间内容
-    $contentBytes = __GitSplit_ApplyHunksToContent -HeadBytes $headBytes -AllHunks $AllHunks -UpToIndex $UpToIndex
+    # 应用当前批次的 hunk 变更，生成中间内容
+    # UpToIndex = Hunks.Count - 1（应用全部本批次 hunk）
+    $contentBytes = __GitSplit_ApplyHunksToContent -HeadBytes $headBytes -AllHunks $Hunks -UpToIndex ($Hunks.Count - 1)
 
     # 写入临时文件
     $tempFile = __GitSplit_GetTempFile -Suffix "content.bin"
