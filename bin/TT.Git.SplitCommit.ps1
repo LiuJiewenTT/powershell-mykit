@@ -22,10 +22,10 @@
       - 所有操作仅针对暂存区，不修改工作区文件
       - git commit 只提交暂存区内容，工作区改动不受影响
       - 无需 stash，无需 stash pop
-      - 执行前保存完整 diff 到 keep_local/.git-split-tmp/，出错可恢复
+      - 执行前保存完整 diff 到 .git/split-tmp/，出错可恢复
 
     临时文件:
-      - 临时文件存放在 keep_local/.git-split-tmp/（被 .gitignore 忽略）
+      - 临时文件存放在 .git/split-tmp/（Git 内部目录，天然被忽略）
       - 文件名含 PID 和时间戳，防止并发冲突
       - 正常完成后自动清理；异常退出时保留，可用于手动恢复
 
@@ -403,6 +403,11 @@ function __GitSplit_GetHeadContentBytes {
     $process.StandardOutput.BaseStream.CopyTo($ms)
     $process.WaitForExit()
 
+    if ($process.ExitCode -ne 0) {
+        $ms.Dispose()
+        return [byte[]]@()
+    }
+
     $bytes = $ms.ToArray()
     $ms.Dispose()
 
@@ -519,11 +524,12 @@ function __GitSplit_GetTempDir {
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
         return $env:TEMP
     }
-    $tmpDir = Join-Path $repoRoot "keep_local\.git-split-tmp"
-    if (-not (Test-Path $tmpDir)) {
-        $null = New-Item -ItemType Directory -Path $tmpDir -Force
+    # 使用 .git/split-tmp/ —— Git 内部目录，天然被忽略，不依赖项目 .gitignore
+    $gitDir = Join-Path $repoRoot ".git\split-tmp"
+    if (-not (Test-Path $gitDir)) {
+        $null = New-Item -ItemType Directory -Path $gitDir -Force
     }
-    return $tmpDir
+    return $gitDir
 }
 
 function __GitSplit_GetTempFile {
@@ -612,6 +618,21 @@ function Split-GitStagedCommit {
 
     if (__GitSplit_HelpInterceptor -CommandName 'Split-GitStagedCommit' -Help:$Help) { return }
     if (-not (__GitSplit_CheckRepo)) { return }
+
+    # 切换到仓库根目录，确保所有 git 命令使用仓库根相对路径
+    # 子目录运行时 git diff --cached --name-only 只返回当前子目录的文件，
+    # 需要在根目录才能获取完整的暂存区文件列表
+    $repoRoot = git rev-parse --show-toplevel 2>$null
+    $pushedLocation = $false
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($repoRoot)) {
+        $currentDir = (Get-Location).Path
+        if ($currentDir -ne $repoRoot) {
+            Push-Location $repoRoot
+            $pushedLocation = $true
+        }
+    }
+
+    try {
     if (-not (__GitSplit_HasStagedChanges)) { return }
 
     if ($MaxBytes -le 0) {
@@ -628,6 +649,10 @@ function Split-GitStagedCommit {
 
     # 获取暂存区文件列表
     $stagedFiles = git diff --cached --name-only
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "错误：无法获取暂存区文件列表" -ForegroundColor Red
+        return
+    }
     if ($null -eq $stagedFiles -or $stagedFiles.Count -eq 0) {
         Write-Host "暂存区为空" -ForegroundColor Yellow
         return
@@ -719,6 +744,7 @@ function Split-GitStagedCommit {
                 # 按 hunk 切分
                 $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes
                 $allHunks = __GitSplit_ParseHunks -FilePath $f
+                $fMode = if ($null -ne $stagedInfo[$f]) { $stagedInfo[$f].Mode } else { '100644' }
                 $hunkIdx = 0
                 foreach ($hb in $hunkBatches) {
                     $hunkIdx += $hb.Hunks.Count
@@ -726,7 +752,7 @@ function Split-GitStagedCommit {
                     $null = $commitPlan.Add([PSCustomObject]@{
                         Type      = 'hunks'
                         FilePath  = $f
-                        Mode      = $stagedInfo[$f].Mode
+                        Mode      = $fMode
                         AllHunks  = $allHunks
                         UpToIndex = $hunkIdx - 1
                         Hunks     = $hb.Hunks
@@ -836,10 +862,35 @@ function Split-GitStagedCommit {
         Remove-Item $backupFile -Force -ErrorAction SilentlyContinue
         Write-Host "  备份文件已清理" -ForegroundColor DarkGray
     }
-    elseif ($anyFail -and $null -ne $backupFile -and (Test-Path $backupFile)) {
-        Write-Host "  有提交失败，备份文件保留: $backupFile" -ForegroundColor Yellow
-        Write-Host "  可用以下命令恢复暂存区:" -ForegroundColor Yellow
-        Write-Host "    git apply --cached `"$backupFile`"" -ForegroundColor White
+    elseif ($anyFail) {
+        Write-Host "  有提交失败！" -ForegroundColor Red
+        # 用 stagedInfo 恢复剩余未提交文件到暂存区
+        $remainingFiles = @()
+        for ($j = $i + 1; $j -lt $commitPlan.Count; $j++) {
+            $planItem = $commitPlan[$j]
+            if ($planItem.Type -eq 'files') {
+                $remainingFiles += @($planItem.FileInfos | ForEach-Object { $_.Path })
+            } else {
+                $remainingFiles += $planItem.FilePath
+            }
+        }
+        if ($remainingFiles.Count -gt 0) {
+            $remainingFiles = $remainingFiles | Select-Object -Unique
+            Write-Host "  以下文件未提交，正在恢复到暂存区: $($remainingFiles -join ', ')" -ForegroundColor Yellow
+            foreach ($rf in $remainingFiles) {
+                $ri = $stagedInfo[$rf]
+                if ($null -eq $ri) { continue }
+                if ($ri.Status -eq 'D') {
+                    git update-index --force-remove -- $ri.Path 2>$null
+                } elseif ($null -ne $ri.Mode -and $null -ne $ri.Hash) {
+                    git update-index --add --cacheinfo "$($ri.Mode),$($ri.Hash),$($ri.Path)" 2>$null
+                }
+            }
+            Write-Host "  暂存区已恢复（已提交的文件除外）" -ForegroundColor Yellow
+        }
+        if ($null -ne $backupFile -and (Test-Path $backupFile)) {
+            Write-Host "  备份文件保留: $backupFile" -ForegroundColor Yellow
+        }
     }
 
     # 汇总
@@ -850,21 +901,44 @@ function Split-GitStagedCommit {
     }
     Write-Host "  未执行 git push，请手动推送" -ForegroundColor Yellow
     Write-Host ""
+
+    } # end try
+    finally {
+        if ($pushedLocation) {
+            Pop-Location
+        }
+    }
 }
 
 
 # 获取完整暂存区 diff 的字节数组（用于备份恢复）
+# 使用 .NET Process 直接读字节流，绕过 PS 5.1 编码转换
 function __GitSplit_GetAllStagedDiffBytes {
-    $diff = git diff --cached 2>$null
-    if ($LASTEXITCODE -ne 0 -or $null -eq $diff -or $diff.Count -eq 0) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "git"
+    $psi.Arguments = "diff --cached"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $psi
+    $process.Start() | Out-Null
+
+    $ms = New-Object System.IO.MemoryStream
+    $process.StandardOutput.BaseStream.CopyTo($ms)
+    $process.WaitForExit()
+
+    if ($process.ExitCode -ne 0) {
+        $ms.Dispose()
         return $null
     }
 
-    $patchText = $diff -join "`n"
-    $patchText += "`n"
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-    return $utf8NoBom.GetBytes($patchText)
+    $bytes = $ms.ToArray()
+    $ms.Dispose()
+    return $bytes
 }
 
 
@@ -877,14 +951,14 @@ function __GitSplit_CommitFiles {
 
     foreach ($info in $FileInfos) {
         if ($info.Status -eq 'D') {
-            # 删除文件
-            git rm --cached -- $info.Path 2>$null
+            # 删除文件：用 update-index --force-remove 避免 pathspec 歧义
+            git update-index --force-remove -- $info.Path 2>$null
         } else {
             # 新增/修改文件
             git update-index --add --cacheinfo "$($info.Mode),$($info.Hash),$($info.Path)" 2>$null
         }
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "    git update-index/rm 失败: $($info.Path)" -ForegroundColor Red
+            Write-Host "    git update-index 失败: $($info.Path)" -ForegroundColor Red
             return $false
         }
     }
