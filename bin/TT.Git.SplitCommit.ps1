@@ -292,6 +292,51 @@ function __GitSplit_GetFileDiffHeader {
 }
 
 
+# 从字节内容解析逐行行尾类型数组
+# 返回 string[]，每个元素为 "CRLF"/"LF"/"None"
+# 用于为拆分后的子 hunk 提供目标文件的行尾参考
+function __GitSplit_ParseEolsFromBytes {
+    param([byte[]]$Bytes)
+
+    $eols = [System.Collections.ArrayList]::new()
+
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) {
+        return $eols.ToArray()
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $content = $utf8NoBom.GetString($Bytes)
+
+    $i = 0
+    $len = $content.Length
+
+    while ($i -lt $len) {
+        if ($content[$i] -eq [char]"`r" -and $i + 1 -lt $len -and $content[$i + 1] -eq [char]"`n") {
+            $null = $eols.Add('CRLF')
+            $i += 2
+        }
+        elseif ($content[$i] -eq [char]"`n") {
+            $null = $eols.Add('LF')
+            $i += 1
+        }
+        else {
+            $i++
+        }
+    }
+
+    # 末尾无换行的最后一行
+    if ($len -gt 0) {
+        # 检查最后一个字符是否是换行
+        $lastChar = $content[$len - 1]
+        if ($lastChar -ne [char]"`n") {
+            $null = $eols.Add('None')
+        }
+    }
+
+    return $eols.ToArray()
+}
+
+
 # 解析文件的 diff 为 hunk 列表
 # 每个 hunk 包含:
 #   AtHeader    @@ 行
@@ -392,9 +437,11 @@ function __GitSplit_FinalizeHunk {
 
 # 将超限的单个 hunk 按 +行 贪心拆分为多个子 hunk
 # 参数:
-#   Hunk      待拆分的 hunk 对象（来自 __GitSplit_ParseHunks / __GitSplit_FinalizeHunk）
-#   MaxBytes  每个子 hunk 的字节上限
-# 返回: 子 hunk 数组（每个子 hunk 都是标准的 hunk 对象）
+#   Hunk       待拆分的 hunk 对象（来自 __GitSplit_ParseHunks / __GitSplit_FinalizeHunk）
+#   MaxBytes   每个子 hunk 的字节上限
+#   TargetEols 目标文件（暂存区内容）的逐行行尾数组，可选
+#              如果提供，为每个子 hunk 的 +行生成 EolHints（目标文件的行尾参考）
+# 返回: 子 hunk 数组（每个子 hunk 都是标准的 hunk 对象，可能含 EolHints 属性）
 #
 # 拆分规则:
 #   - 修改型 hunk（OldCount > 0）: 第一个子 hunk 保留 - 行（完成删除），后续子 hunk
@@ -403,19 +450,16 @@ function __GitSplit_FinalizeHunk {
 #   - 每个子 hunk 生成自己的 @@ 头
 #   - \ No newline at end of file 只附在最后一个子 hunk
 #
-# 重要：后续子 hunk 的 OldStart 基于"前一个子 hunk 提交后的 HEAD 行号"计算，
-# 而非原始 hunk 的旧行号。这是因为每次提交后 HEAD 已经改变，
-# 后续子 hunk 必须基于新的 HEAD 定位插入位置。
-#
-# 具体计算:
+# OldStart 定位策略（基于旧行号参考系，与 ApplyHunksToContent 的累积模式一致）:
 #   - 第一个子 hunk: OldStart = 原始 oldStart, OldCount = 原始 oldCount
-#   - 第 k 个子 hunk (k>0): OldStart = 原始 oldStart + sum(前 k 个子 hunk 的 +行数) - 1
-#     （因为第一个子 hunk 删除了 oldCount 行并插入了 N1 行，
-#       HEAD 中该区域变成了 N1 行，所以下一个插入点在第 N1 行之后）
+#   - 后续子 hunk (gi > 0): 纯插入型 OldCount=0
+#     修改型原始 hunk (oldCount > 0): OldStart = oldStart + oldCount - 1（旧行最后一行之后）
+#     新增型原始 hunk (oldStart = 0, oldCount = 0): OldStart = 0（旧行不存在）
 function __GitSplit_SplitSingleHunk {
     param(
         [object]$Hunk,
-        [long]$MaxBytes
+        [long]$MaxBytes,
+        [string[]]$TargetEols
     )
 
     $utf8 = [System.Text.Encoding]::UTF8
@@ -510,35 +554,47 @@ function __GitSplit_SplitSingleHunk {
         }
 
         # 构造 @@ 头
-        # 后续子 hunk 的 OldStart 基于前一个子 hunk 提交后的 HEAD 行号：
-        #   第一个子 hunk 提交后，原区域变成 N1 行（第一组+行数），
-        #   所以第二个子 hunk 应在 oldStart-1+N1 位置之后插入，
-        #   即 OldStart = oldStart - 1 + N1 + 1 = oldStart + N1
+        # OldStart 定位策略（基于旧行号参考系，与 ApplyHunksToContent 的累积模式一致）:
+        #   - 第一个子 hunk: OldStart = 原始 oldStart, OldCount = 原始 oldCount
+        #   - 后续子 hunk (gi > 0): 纯插入型，OldCount=0
+        #     OldStart 需要基于旧行号，而非新内容行号，这样 ApplyHunksToContent
+        #     中的 offset 才能正确将其映射到结果中的位置：
+        #       - 修改型原始 hunk (oldCount > 0): OldStart = oldStart + oldCount - 1
+        #         （旧行最后一行之后，因为旧行已被第一个子 hunk 删除）
+        #       - 新增型原始 hunk (oldStart = 0, oldCount = 0): OldStart = 0
+        #         （旧行不存在，所有插入都从虚拟位置 0 开始）
+        #   ApplyHunksToContent 中: pos = oldStart + offset（纯插入型）
+        #   验证修改型: 子hunk[0]删旧行1-10插5行→offset=-5; 子hunk[1] OldStart=10→pos=10+(-5)=5✅
+        #   验证新增型: 子hunk[0]插5行→offset=5; 子hunk[1] OldStart=0→pos=0+5=5✅
         if ($gi -eq 0) {
             $subOldStart = $oldStart
             $subOldCount = $oldCount
         }
         else {
-            # 计算前面所有子 hunk 的 +行总数
-            $prevAddLines = 0
-            for ($pk = 0; $pk -lt $gi; $pk++) {
-                $prevAddLines += $groups[$pk].Count
+            if ($oldCount -gt 0) {
+                # 修改型：旧行最后一行之后
+                $subOldStart = $oldStart + $oldCount - 1
             }
-            $subOldStart = $oldStart + $prevAddLines
+            else {
+                # 新增型：旧行不存在
+                $subOldStart = 0
+            }
             $subOldCount = 0
         }
         $subNewCount = $g.Count
 
-        # 计算 NewStart
+        # 计算 NewStart（新内容中的行号，1-based）
+        # 第一个子 hunk: 新内容从旧行起始位置开始
+        # 后续子 hunk: 新内容从前面所有子 hunk 的 +行数之后开始
         if ($gi -eq 0) {
             $subNewStart = $oldStart
         }
         else {
-            $prevAddLines2 = 0
+            $prevAddLines = 0
             for ($pk = 0; $pk -lt $gi; $pk++) {
-                $prevAddLines2 += $groups[$pk].Count
+                $prevAddLines += $groups[$pk].Count
             }
-            $subNewStart = $oldStart + $prevAddLines2
+            $subNewStart = $oldStart + $prevAddLines
         }
 
         # 构造 @@ 头字符串
@@ -554,6 +610,22 @@ function __GitSplit_SplitSingleHunk {
             $atHeader = "@@ -$subOldStart,$subOldCount +$subNewStart,$subNewCount @@"
         }
 
+        # 构建 EolHints：从目标文件的行尾信息中提取每个 +行对应的行尾
+        # 仅在提供了 TargetEols 时生成
+        $eolHints = $null
+        if ($null -ne $TargetEols -and $TargetEols.Count -gt 0) {
+            $eolHints = [System.Collections.ArrayList]::new()
+            for ($j = $g.StartIndex; $j -lt $g.StartIndex + $g.Count; $j++) {
+                if ($j -lt $TargetEols.Count) {
+                    $null = $eolHints.Add($TargetEols[$j])
+                }
+                else {
+                    $null = $eolHints.Add('LF')
+                }
+            }
+            $eolHints = $eolHints.ToArray()
+        }
+
         $subHunk = [PSCustomObject]@{
             AtHeader     = $atHeader
             Lines        = $subLines.ToArray()
@@ -562,6 +634,7 @@ function __GitSplit_SplitSingleHunk {
             OldCount     = $subOldCount
             NoNewlineOld = ($gi -eq 0 -and $Hunk.NoNewlineOld -and $groups.Count -gt 1)
             NoNewlineNew = ($gi -eq $groups.Count - 1 -and $Hunk.NoNewlineNew)
+            EolHints     = $eolHints
         }
 
         $null = $subHunks.Add($subHunk)
@@ -574,10 +647,12 @@ function __GitSplit_SplitSingleHunk {
 # 将超限文件按 hunk 贪心分批
 # 每个 hunk batch 包含: FilePath, Hunks, AddBytes
 # 对超限的单个 hunk，调用 __GitSplit_SplitSingleHunk 按行拆分
+# TargetEols: 目标文件（暂存区内容）的逐行行尾数组，可选
 function __GitSplit_SplitFileByHunks {
     param(
         [string]$FilePath,
-        [long]$MaxBytes
+        [long]$MaxBytes,
+        [string[]]$TargetEols
     )
 
     $hunks = __GitSplit_ParseHunks -FilePath $FilePath
@@ -589,7 +664,7 @@ function __GitSplit_SplitFileByHunks {
     $expandedHunks = [System.Collections.ArrayList]::new()
     foreach ($hunk in $hunks) {
         if ($hunk.AddBytes -gt $MaxBytes) {
-            $subHunks = __GitSplit_SplitSingleHunk -Hunk $hunk -MaxBytes $MaxBytes
+            $subHunks = __GitSplit_SplitSingleHunk -Hunk $hunk -MaxBytes $MaxBytes -TargetEols $TargetEols
             foreach ($sh in $subHunks) {
                 $null = $expandedHunks.Add($sh)
             }
@@ -693,6 +768,19 @@ function __GitSplit_GreedyPack {
 }
 
 
+# 获取暂存区文件的完整内容字节（不含 BOM）
+# 从 git cat-file -p :FilePath 获取（索引中的内容）
+function __GitSplit_GetStagedContentBytes {
+    param([string]$FilePath)
+
+    $bytes = __GitSplit_RunGitBytes -Arguments "cat-file -p :$FilePath"
+    if ($null -eq $bytes) {
+        return [byte[]]@()
+    }
+    return $bytes
+}
+
+
 # 获取暂存区文件的 mode 和 blob hash
 # 返回 @{Status='A'|'M'|'D'; Mode='100644'; Hash='abc123'} 或 $null
 function __GitSplit_GetStagedFileInfo {
@@ -747,7 +835,16 @@ function __GitSplit_GetHeadContentBytes {
 #   HeadBytes   HEAD 版本的原始字节
 #   AllHunks    该文件的所有 hunk（按顺序）
 #   UpToIndex   应用 hunk 0..UpToIndex（含）
-# 返回: 应用后的内容字节（保留原始 BOM 和行尾格式）
+# 返回: 应用后的内容字节（保留原始 BOM 和逐行行尾格式）
+#
+# 行尾保留策略:
+#   - 入口逐字节扫描，拆分每行并记录其行尾类型（CRLF / LF / 无行尾）
+#   - 行操作（插入/删除）时，行尾类型与行内容绑定
+#   - 删除旧行时连同其行尾信息一起删除
+#   - 替换型 hunk 删除旧行时，被新行未覆盖的旧行行尾保存到 pendingEols 队列
+#   - 纯插入型 hunk 优先从 pendingEols 队列取行尾（用于 SplitSingleHunk 拆分后的场景）
+#   - 无 pendingEols 时，纯插入型继承前一行的行尾；无前行则后一行；都无则 LF
+#   - 新增文件的 + 行默认 LF（新文件无 HEAD 内容可继承）
 function __GitSplit_ApplyHunksToContent {
     param(
         [byte[]]$HeadBytes,
@@ -757,57 +854,80 @@ function __GitSplit_ApplyHunksToContent {
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 
-    # ---- 检测原始字节的 BOM 和行尾特征 ----
+    # ---- 检测 BOM ----
     $hasBom = ($HeadBytes.Length -ge 3 -and $HeadBytes[0] -eq 0xEF -and $HeadBytes[1] -eq 0xBB -and $HeadBytes[2] -eq 0xBF)
-    $hasCrlf = $false
-    for ($b = 0; $b -lt $HeadBytes.Length - 1; $b++) {
-        if ($HeadBytes[$b] -eq 0x0D -and $HeadBytes[$b + 1] -eq 0x0A) {
-            $hasCrlf = $true
-            break
+
+    # ---- 逐字节扫描，拆分行并记录每行行尾类型 ----
+    # 每个元素: @{ Text=行内容; Eol="CRLF"/"LF"/"None" }
+    $rawLines = [System.Collections.ArrayList]::new()
+
+    if ($HeadBytes.Length -eq 0) {
+        # 空 HEAD（新文件），无行
+    }
+    else {
+        # 字节转字符串
+        $content = $utf8NoBom.GetString($HeadBytes)
+
+        $lineStart = 0
+        $len = $content.Length
+        $i = 0
+
+        while ($i -lt $len) {
+            if ($content[$i] -eq [char]"`r" -and $i + 1 -lt $len -and $content[$i + 1] -eq [char]"`n") {
+                # CRLF 行尾
+                $text = $content.Substring($lineStart, $i - $lineStart)
+                $null = $rawLines.Add(@{ Text = $text; Eol = 'CRLF' })
+                $i += 2
+                $lineStart = $i
+            }
+            elseif ($content[$i] -eq [char]"`n") {
+                # LF 行尾
+                $text = $content.Substring($lineStart, $i - $lineStart)
+                $null = $rawLines.Add(@{ Text = $text; Eol = 'LF' })
+                $i += 1
+                $lineStart = $i
+            }
+            else {
+                $i += 1
+            }
+        }
+
+        # 处理末尾无换行的内容
+        if ($lineStart -lt $len) {
+            $text = $content.Substring($lineStart)
+            $null = $rawLines.Add(@{ Text = $text; Eol = 'None' })
         }
     }
 
-    # 字节转字符串（UTF8Encoding 自动吞掉 BOM，不影响后续操作）
-    if ($HeadBytes.Length -eq 0) {
-        $content = ""
-    } else {
-        $content = $utf8NoBom.GetString($HeadBytes)
-    }
+    # ---- 准备行列表（纯文本）和行尾列表 ----
+    # 同步维护两个列表，索引一一对应
+    $lines = [System.Collections.ArrayList]::new()
+    $eols = [System.Collections.ArrayList]::new()   # 每行的行尾类型
 
-    # 判断是否有尾换行
-    $hasTrailingNewline = $content.EndsWith("`n")
-
-    # 统一换行为 LF（仅用于行操作，输出时按原格式恢复）
-    $content = $content -replace "`r`n", "`n"
-
-    # 去掉尾部换行以便按行处理
-    if ($content.EndsWith("`n")) {
-        $content = $content.Substring(0, $content.Length - 1)
-    }
-
-    # 拆分为行
-    if ([string]::IsNullOrEmpty($content)) {
-        $lines = [System.Collections.ArrayList]::new()
-    } else {
-        $lines = [System.Collections.ArrayList]@($content -split "`n")
+    foreach ($rl in $rawLines) {
+        $null = $lines.Add($rl.Text)
+        $null = $eols.Add($rl.Eol)
     }
 
     $offset = 0
 
-    for ($i = 0; $i -le $UpToIndex; $i++) {
-        $hunk = $AllHunks[$i]
+    # 新文件标志（用于决定 + 行的默认行尾）
+    $isNewFile = ($HeadBytes.Length -eq 0)
+
+    # 旧行行尾待用队列：替换型 hunk 删除旧行时，被新行未覆盖的旧行行尾保存于此
+    # 后续纯插入型 hunk 优先从此队列取行尾，保证拆分后的子 hunk 行尾继承正确
+    $pendingEols = [System.Collections.Queue]::new()
+
+    for ($hi = 0; $hi -le $UpToIndex; $hi++) {
+        $hunk = $AllHunks[$hi]
 
         $oldStart = $hunk.OldStart
         $oldCount = $hunk.OldCount
 
         # 在当前结果中的位置（0-based）
-        # 新文件 hunk 的 OldStart=0（@@ -0,0 +1,N @@），pos 应为 0
-        # OldCount=0 的纯插入 hunk：OldStart 表示"在第 OldStart 行之后插入"，pos = OldStart + offset
-        # OldCount>0 的替换 hunk：pos = OldStart - 1 + offset（0-based 起始位置）
         if ($oldStart -eq 0) {
             $pos = 0 + $offset
         } elseif ($oldCount -eq 0) {
-            # 纯插入：在第 oldStart 行之后插入，0-based 就是 oldStart
             $pos = $oldStart + $offset
         } else {
             $pos = $oldStart - 1 + $offset
@@ -825,42 +945,126 @@ function __GitSplit_ApplyHunksToContent {
             }
         }
 
-        # 删除旧行
+        # 确定新行的行尾类型（必须在删除旧行之前，因为需要参考旧行的行尾）：
+        # 优先级：EolHints（来自目标文件） > 旧行继承 / pendingEols > 前一行继承
+        #
+        # 策略:
+        #   1. 如果 hunk 有 EolHints（来自 SplitSingleHunk 的 TargetEols），直接使用
+        #      这是目标文件（暂存区内容）中的实际行尾，最准确
+        #   2. 替换型（oldCount > 0）：按顺序继承被替换旧行的行尾，多余的行继承最后一旧行
+        #      同时将被新行未覆盖的旧行行尾保存到 pendingEols
+        #   3. 纯插入型（oldCount = 0）：优先从 pendingEols 取行尾；无则继承前一行行尾
+        #   4. 新文件（HeadBytes.Length = 0）：默认 LF
+        $newEolDefaults = [System.Collections.ArrayList]::new()
+
+        # 检查是否有 EolHints（来自 SplitSingleHunk 的目标文件行尾）
+        $hasEolHints = ($null -ne $hunk.EolHints -and $hunk.EolHints.Count -gt 0)
+
+        if ($hasEolHints) {
+            # 直接使用目标文件的行尾（最准确）
+            foreach ($eolHint in $hunk.EolHints) {
+                $null = $newEolDefaults.Add($eolHint)
+            }
+        }
+        elseif ($oldCount -gt 0) {
+            # 替换型：按顺序继承被替换旧行的行尾
+            for ($ni = 0; $ni -lt $newLines.Count; $ni++) {
+                if ($ni -lt $oldCount -and ($pos + $ni) -lt $eols.Count) {
+                    $e = $eols[$pos + $ni]
+                    $null = $newEolDefaults.Add($(if ($e -ne 'None') { $e } else { 'LF' }))
+                }
+                else {
+                    # 多余行继承最后一旧行的行尾
+                    $lastOldIdx = [Math]::Min($pos + $oldCount - 1, $eols.Count - 1)
+                    if ($lastOldIdx -ge 0) {
+                        $lastEol = $eols[$lastOldIdx]
+                        $null = $newEolDefaults.Add($(if ($lastEol -ne 'None') { $lastEol } else { 'LF' }))
+                    }
+                    else {
+                        $null = $newEolDefaults.Add('LF')
+                    }
+                }
+            }
+
+            # 将被新行未覆盖的旧行行尾保存到 pendingEols
+            # 旧行索引范围: pos..pos+oldCount-1
+            # 新行覆盖了前 min(newLines.Count, oldCount) 行
+            # 未覆盖的旧行: 从 pos+min(newLines.Count, oldCount) 开始
+            $coveredCount = [Math]::Min($newLines.Count, $oldCount)
+            for ($ri = $coveredCount; $ri -lt $oldCount; $ri++) {
+                if (($pos + $ri) -lt $eols.Count) {
+                    $eolVal = $eols[$pos + $ri]
+                    if ($eolVal -eq 'None') { $eolVal = 'LF' }
+                    $pendingEols.Enqueue($eolVal)
+                }
+            }
+        }
+        elseif ($isNewFile) {
+            # 新文件：默认 LF
+            foreach ($nl in $newLines) {
+                $null = $newEolDefaults.Add('LF')
+            }
+        }
+        else {
+            # 纯插入：优先从 pendingEols 取行尾（替换型 hunk 留下的旧行行尾），
+            # 保证 SplitSingleHunk 拆分后的子 hunk 行尾继承正确
+            for ($ni = 0; $ni -lt $newLines.Count; $ni++) {
+                if ($pendingEols.Count -gt 0) {
+                    $null = $newEolDefaults.Add($pendingEols.Dequeue())
+                }
+                else {
+                    # 无待用行尾：继承插入位置前一行的行尾
+                    $inheritEol = 'LF'
+                    if ($pos -gt 0 -and ($pos - 1) -lt $eols.Count) {
+                        $prevEol = $eols[$pos - 1]
+                        $inheritEol = if ($prevEol -ne 'None') { $prevEol } else { 'LF' }
+                    }
+                    elseif ($pos -lt $eols.Count) {
+                        $nextEol = $eols[$pos]
+                        $inheritEol = if ($nextEol -ne 'None') { $nextEol } else { 'LF' }
+                    }
+                    $null = $newEolDefaults.Add($inheritEol)
+                }
+            }
+        }
+
+        # 删除旧行（连同行尾信息）
         $removeCount = [Math]::Min($oldCount, [Math]::Max(0, $lines.Count - $pos))
         if ($removeCount -gt 0) {
             $lines.RemoveRange($pos, $removeCount)
+            $eols.RemoveRange($pos, $removeCount)
         }
 
-        # 插入新行
+        # 插入新行（连同行尾信息）
         for ($j = 0; $j -lt $newLines.Count; $j++) {
             $lines.Insert($pos + $j, $newLines[$j])
+            # 行尾：使用 $newEolDefaults 中的逐行值
+            if ($j -eq ($newLines.Count - 1) -and $hunk.NoNewlineNew) {
+                $eols.Insert($pos + $j, 'None')
+            }
+            else {
+                $eols.Insert($pos + $j, $newEolDefaults[$j])
+            }
         }
 
         # 更新偏移
         $offset += ($newLines.Count - $oldCount)
+    }
 
-        # 追踪尾换行状态
-        if ($hunk.NoNewlineNew) {
-            $hasTrailingNewline = $false
-        } elseif ($hunk.NoNewlineOld) {
-            $hasTrailingNewline = $true
-        } elseif ($HeadBytes.Length -eq 0 -and $newLines.Count -gt 0) {
-            # 新文件且有 + 行，默认有尾换行（除非 NoNewlineNew 已处理）
-            $hasTrailingNewline = $true
+    # ---- 重建内容（逐行拼接，保留行尾格式）----
+    # 最后一行的 NoNewlineNew 处理：如果最末行行尾是 None 则不加换行
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $null = $sb.Append($lines[$i])
+        if ($eols[$i] -eq 'CRLF') {
+            $null = $sb.Append("`r`n")
         }
+        elseif ($eols[$i] -eq 'LF') {
+            $null = $sb.Append("`n")
+        }
+        # 'None' → 不追加行尾
     }
-
-    # 重建内容（用 LF 连接）
-    $result = $lines -join "`n"
-    if ($hasTrailingNewline -and $lines.Count -gt 0) {
-        $result += "`n"
-    }
-
-    # ---- 恢复原始行尾格式 ----
-    if ($hasCrlf) {
-        # LF → CRLF（仅转换行间的 \n，不触碰行内容中的裸 \n）
-        $result = $result -replace "(?<!\r)\n", "`r`n"
-    }
+    $result = $sb.ToString()
 
     # 编码为字节
     $bytes = $utf8NoBom.GetBytes($result)
@@ -1123,7 +1327,11 @@ function Split-GitStagedCommit {
                 }
 
                 # 按 hunk 切分（含单 hunk 内按行切分）
-                $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes
+                # 获取暂存区目标文件内容，解析行尾信息供行级切分使用
+                $stagedContentBytes = __GitSplit_GetStagedContentBytes -FilePath $f
+                $targetEols = __GitSplit_ParseEolsFromBytes -Bytes $stagedContentBytes
+
+                $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes -TargetEols $targetEols
                 $fMode = if ($null -ne $stagedInfo[$f]) { $stagedInfo[$f].Mode } else { '100644' }
 
                 if ($hunkBatches.Count -le 1 -and $hunkBatches[0].Hunks.Count -le 1) {
@@ -1140,21 +1348,40 @@ function Split-GitStagedCommit {
                     })
                 }
                 else {
-                    # 增量提交模式：每个批次只包含当前批次需要应用的 hunk
-                    # CommitHunks 从当前 HEAD 开始，只应用本批次的 hunk（而非累积 AllHunks）
+                    # 累积提交模式：构建完整展开 hunk 列表，每次从原始 HEAD 累积应用
+                    # 保存原始 HEAD 字节，保证行尾信息在累积应用过程中始终可参考
+                    $origHeadBytes = __GitSplit_GetHeadContentBytes -FilePath $f
+
+                    # 构建展开后的 AllHunks（超限 hunk 替换为子 hunk）
+                    $expandedAllHunks = [System.Collections.ArrayList]::new()
+                    foreach ($hk in (__GitSplit_ParseHunks -FilePath $f)) {
+                        if ($hk.AddBytes -gt $MaxBytes) {
+                            foreach ($sh in (__GitSplit_SplitSingleHunk -Hunk $hk -MaxBytes $MaxBytes -TargetEols $targetEols)) {
+                                $null = $expandedAllHunks.Add($sh)
+                            }
+                        }
+                        else {
+                            $null = $expandedAllHunks.Add($hk)
+                        }
+                    }
+                    $allHunksExpanded = $expandedAllHunks.ToArray()
+
                     $hunkIdx = 0
                     foreach ($hb in $hunkBatches) {
                         $hunkIdx += $hb.Hunks.Count
                         $seq++
                         $null = $commitPlan.Add([PSCustomObject]@{
-                            Type      = 'hunks'
-                            FilePath  = $f
-                            Mode      = $fMode
-                            Hunks     = $hb.Hunks
-                            Bytes     = $hb.AddBytes
-                            Seq       = $seq
-                            CommitMsg = "$Message #$seq"
-                            Note      = "hunk 切分为 $($hunkBatches.Count) 批（含行切分）"
+                            Type           = 'hunks'
+                            FilePath       = $f
+                            Mode           = $fMode
+                            AllHunks       = $allHunksExpanded
+                            UpToIndex      = $hunkIdx - 1
+                            OrigHeadBytes  = $origHeadBytes
+                            Hunks          = $hb.Hunks
+                            Bytes          = $hb.AddBytes
+                            Seq            = $seq
+                            CommitMsg      = "$Message #$seq"
+                            Note           = "hunk 切分为 $($hunkBatches.Count) 批（含行切分）"
                         })
                     }
                 }
@@ -1238,7 +1465,7 @@ function Split-GitStagedCommit {
         }
         else {
             Write-Host "    文件: $($item.FilePath)  [hunk 切分, $($item.Hunks.Count) hunk]" -ForegroundColor Gray
-            $success = __GitSplit_CommitHunks -FilePath $item.FilePath -Mode $item.Mode -Hunks $item.Hunks -CommitMsg $item.CommitMsg
+            $success = __GitSplit_CommitHunks -FilePath $item.FilePath -Mode $item.Mode -AllHunks $item.AllHunks -UpToIndex $item.UpToIndex -CommitMsg $item.CommitMsg -OrigHeadBytes $item.OrigHeadBytes
         }
 
         if ($success) {
@@ -1347,23 +1574,30 @@ function __GitSplit_CommitFiles {
 }
 
 
-# Hunk 切分提交（增量模式）：从当前 HEAD 应用当前批次的 hunk，生成中间内容后提交
-# 每次只接收当前批次需要应用的 hunk 列表，从当前 HEAD 内容开始应用
-# 这样每次提交后 HEAD 更新，下一次调用自然基于新的 HEAD
+# Hunk 切分提交（累积模式）：从原始 HEAD 累积应用 hunk，生成中间内容后提交
+# 参数:
+#   FilePath       文件路径
+#   Mode           文件模式（如 100644）
+#   AllHunks       完整的展开后 hunk 列表（含行切分后的子 hunk）
+#   UpToIndex      本次应用 AllHunks[0..UpToIndex]
+#   CommitMsg      提交注释
+#   OrigHeadBytes  原始 HEAD 中该文件的字节内容（从 git reset 前保存）
+#
+# 关键设计：每次从原始 HEAD 开始累积应用所有 hunk[0..UpToIndex]，
+# 而非从当前 HEAD 增量应用。这样可以正确保留每行的行尾格式，
+# 因为原始 HEAD 中每行的行尾信息在累积过程中始终可参考。
 function __GitSplit_CommitHunks {
     param(
         [string]$FilePath,
         [string]$Mode,
-        [object[]]$Hunks,
-        [string]$CommitMsg
+        [object[]]$AllHunks,
+        [int]$UpToIndex,
+        [string]$CommitMsg,
+        [byte[]]$OrigHeadBytes
     )
 
-    # 获取当前 HEAD 内容字节
-    $headBytes = __GitSplit_GetHeadContentBytes -FilePath $FilePath
-
-    # 应用当前批次的 hunk 变更，生成中间内容
-    # UpToIndex = Hunks.Count - 1（应用全部本批次 hunk）
-    $contentBytes = __GitSplit_ApplyHunksToContent -HeadBytes $headBytes -AllHunks $Hunks -UpToIndex ($Hunks.Count - 1)
+    # 从原始 HEAD 字节累积应用 hunk[0..UpToIndex]
+    $contentBytes = __GitSplit_ApplyHunksToContent -HeadBytes $OrigHeadBytes -AllHunks $AllHunks -UpToIndex $UpToIndex
 
     # 写入临时文件
     $tempFile = __GitSplit_GetTempFile -Suffix "content.bin"
