@@ -1,5 +1,8 @@
 /.vscode/
+.temp/
+__pycache__/
 keep_local/
 /mybackup/
 *.json
+*.pyc
 /net_config_classes.txt
