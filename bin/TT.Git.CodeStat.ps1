@@ -1,13 +1,14 @@
 ﻿
 <#
 .SYNOPSIS
-    Git 代码统计工具 - 字符数 / UTF-8 字节数 / 仅新增字节数
+    Git 代码统计工具 - 行数 / 字符数 / UTF-8 字节数
 .DESCRIPTION
-    统计 Git 变更代码的字符数和字节数，三种方案独立可用：
-      方案1 Get-GitCodeCharStat    - 字符数统计（新增/删除/合计）
-      方案2 Get-GitCodeByteStat    - UTF-8 字节数统计（新增/删除/合计）
-      方案3 Get-GitCodeNewByteStat - 仅新增代码 UTF-8 字节数
-      综合入口 Get-GitCodeStat     - 同时输出三种方案结果
+     统计 Git 变更代码的行数、字符数和字节数，四种方案独立可用：
+      方案1 Get-GitCodeLineStat    - 行数统计（新增/删除/合计）
+      方案2 Get-GitCodeCharStat    - 字符数统计（新增/删除/合计）
+      方案3 Get-GitCodeByteStat    - UTF-8 字节数统计（新增/删除/合计）
+      方案4 Get-GitCodeNewByteStat - 仅新增代码 UTF-8 字节数
+      综合入口 Get-GitCodeStat     - 同时输出四种方案结果
 
     参数说明:
       无参数        → 同时统计暂存区 + 最新提交(HEAD)
@@ -54,11 +55,15 @@ function __GitCodeStat_Compute {
     )
 
     $utf8 = [System.Text.Encoding]::UTF8
+    $addLine = 0; $delLine = 0
     $addChar = 0; $delChar = 0
     $addByte = 0; $delByte = 0
 
     if (-not $DiffLines -or $DiffLines.Count -eq 0) {
         return [PSCustomObject]@{
+            Add_Lines   = 0
+            Del_Lines   = 0
+            Total_Lines = 0
             Add_Char    = 0
             Del_Char    = 0
             Total_Char  = 0
@@ -79,22 +84,29 @@ function __GitCodeStat_Compute {
         # -NoWhitespace: 移除所有空白字符（空格、制表符、换行、回车等）
         if ($NoWhitespace) {
             $content = $content -replace '\s', ''
+            # -NoWhitespace 时全空白行不计入行数
+            if ($content.Length -eq 0) { continue }
         }
 
         $charLen = $content.Length
         $byteLen = $utf8.GetByteCount($content)
 
         if ($line.StartsWith('+')) {
+            $addLine++
             $addChar += $charLen
             $addByte += $byteLen
         }
         else {
+            $delLine++
             $delChar += $charLen
             $delByte += $byteLen
         }
     }
 
     return [PSCustomObject]@{
+        Add_Lines   = $addLine
+        Del_Lines   = $delLine
+        Total_Lines = $addLine + $delLine
         Add_Char    = $addChar
         Del_Char    = $delChar
         Total_Char  = $addChar + $delChar
@@ -214,16 +226,18 @@ function __GitCodeStat_WriteHeader {
 }
 
 
-# 打印单项统计（字符+字节全量，带子 section 标题）
+# 打印综合统计（行数+字符+字节全量，带子 section 标题）
 # 标签间距硬编码，无需动态计算显示宽度
-# 标签显示宽度: "新增代码总字符"=12, "删除代码总字符"=12, "变更合计字符数"=12,
-#               "新增代码UTF8总字节"=17, "删除代码UTF8总字节"=17, "变更合计字节"=10
-# 目标显示宽度 17，按差值补空格
 function __GitCodeStat_WriteFull {
     param([PSCustomObject]$Stat)
 
     $fmt = '{0,12:N0}'
 
+    Write-Host "  --- 行数统计 ---" -ForegroundColor Gray
+    Write-Host "  新增代码总行数     $($fmt -f $Stat.Add_Lines)"
+    Write-Host "  删除代码总行数     $($fmt -f $Stat.Del_Lines)"
+    Write-Host "  变更合计行数       $($fmt -f $Stat.Total_Lines)"
+    Write-Host ""
     Write-Host "  --- 字符数统计 ---" -ForegroundColor Gray
     Write-Host "  新增代码总字符     $($fmt -f $Stat.Add_Char)"
     Write-Host "  删除代码总字符     $($fmt -f $Stat.Del_Char)"
@@ -240,22 +254,70 @@ function __GitCodeStat_WriteFull {
 
 
 # ============================================================
-# 方案1: 统计代码字符数（新增 / 删除 / 合计）
+# 方案1: 统计代码行数（新增 / 删除 / 合计）
 # ============================================================
-function Get-GitCodeCharStat {
+function Get-GitCodeLineStat {
     <#
     .SYNOPSIS
-        统计 Git 变更代码的字符数（方案1）
+        统计 Git 变更代码的行数（方案1）
     .DESCRIPTION
-        统计新增、删除及合计字符数（不含行首 +/- 符号）。
+        统计新增、删除及合计行数。
+        -NoWhitespace 时全空白行（仅含空格/制表符）不计入行数。
 
         无参数   → 统计最新提交 HEAD^..HEAD
         -Staged  → 仅统计暂存区
         -Commit1 xxx → xxx..HEAD
         -Commit1 xxx -Commit2 yyy → xxx..yyy
         -PassThru → 返回原始统计对象（供编程使用）
-        -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
+        -NoWhitespace → 排除空白行不计入行数
         -Help → 显示完整帮助（等同 Get-Help -Full）
+    .EXAMPLE
+        Get-GitCodeLineStat
+        Get-GitCodeLineStat -Staged
+        Get-GitCodeLineStat HEAD~3
+        Get-GitCodeLineStat v1.0 v2.0
+        Get-GitCodeLineStat -NoWhitespace
+        Get-GitCodeLineStat -Help
+        $s = Get-GitCodeLineStat -PassThru
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [string]$Commit1,
+        [Parameter(Position = 1)]
+        [string]$Commit2,
+        [switch]$Staged,
+        [switch]$PassThru,
+        [switch]$NoWhitespace,
+        [switch]$Help
+    )
+
+    if (__GitCodeStat_HelpInterceptor -CommandName 'Get-GitCodeLineStat' -Help:$Help) { return }
+    if (-not (__GitCodeStat_ValidateParams @PSBoundParameters)) { return }
+    if (-not (__GitCodeStat_CheckRepo)) { return }
+
+    $diffLines = __GitCodeStat_GetDiff -Commit1 $Commit1 -Commit2 $Commit2 -Staged:$Staged
+    $stat = __GitCodeStat_Compute -DiffLines $diffLines -NoWhitespace:$NoWhitespace
+
+    Write-Host "新增代码总行数: $($stat.Add_Lines)"
+    Write-Host "删除代码总行数: $($stat.Del_Lines)"
+    Write-Host "变更合计行数:   $($stat.Total_Lines)"
+
+    if ($PassThru) { return $stat }
+}
+
+
+# ============================================================
+# 方案2: 统计代码字符数（新增 / 删除 / 合计）
+# ============================================================
+function Get-GitCodeCharStat {
+    <#
+    .SYNOPSIS
+        统计 Git 变更代码的字符数（方案2）
+    .DESCRIPTION
+        统计新增、删除及合计字符数（不含行首 +/- 符号）。
+
+        参数同 Get-GitCodeLineStat。
     .EXAMPLE
         Get-GitCodeCharStat
         Get-GitCodeCharStat -Staged
@@ -293,17 +355,17 @@ function Get-GitCodeCharStat {
 
 
 # ============================================================
-# 方案2: 统计代码 UTF-8 字节数（新增 / 删除 / 合计）
+# 方案3: 统计代码 UTF-8 字节数（新增 / 删除 / 合计）
 # ============================================================
 function Get-GitCodeByteStat {
     <#
     .SYNOPSIS
-        统计 Git 变更代码的 UTF-8 字节数（方案2）
+        统计 Git 变更代码的 UTF-8 字节数（方案3）
     .DESCRIPTION
         统计新增、删除及合计 UTF-8 字节数。
         字符 != 字节，中文/符号等占多字节时此方案更准确。
 
-        参数同 Get-GitCodeCharStat。
+        参数同 Get-GitCodeLineStat。
     .EXAMPLE
         Get-GitCodeByteStat
         Get-GitCodeByteStat -Staged
@@ -341,17 +403,17 @@ function Get-GitCodeByteStat {
 
 
 # ============================================================
-# 方案3: 仅统计新增代码 UTF-8 字节数
+# 方案4: 仅统计新增代码 UTF-8 字节数
 # ============================================================
 function Get-GitCodeNewByteStat {
     <#
     .SYNOPSIS
-        仅统计 Git 变更中新增代码的 UTF-8 字节数（方案3）
+        仅统计 Git 变更中新增代码的 UTF-8 字节数（方案4）
     .DESCRIPTION
         只统计 + 行的 UTF-8 字节，忽略删除行。
         适合只关注代码增长量的场景。
 
-        参数同 Get-GitCodeCharStat。
+        参数同 Get-GitCodeLineStat。
     .EXAMPLE
         Get-GitCodeNewByteStat
         Get-GitCodeNewByteStat -Staged
@@ -387,19 +449,19 @@ function Get-GitCodeNewByteStat {
 
 
 # ============================================================
-# 综合入口: 同时输出三种方案结果
+# 综合入口: 同时输出四种方案结果
 # ============================================================
 function Get-GitCodeStat {
     <#
     .SYNOPSIS
         Git 代码统计综合入口
     .DESCRIPTION
-        同时输出字符数、UTF-8字节数、仅新增字节数三种统计结果。
+        同时输出行数、字符数、UTF-8字节数、仅新增字节数四种统计结果。
 
-        无参数        → 同时统计暂存区 + 最新提交(HEAD) 各自的三种方案
-        -Staged       → 仅暂存区（三种方案）
-        -Commit1 xxx  → xxx..HEAD（三种方案）
-        -Commit1 xxx -Commit2 yyy → xxx..yyy（三种方案）
+        无参数        → 同时统计暂存区 + 最新提交(HEAD) 各自的四种方案
+        -Staged       → 仅暂存区（四种方案）
+        -Commit1 xxx  → xxx..HEAD（四种方案）
+        -Commit1 xxx -Commit2 yyy → xxx..yyy（四种方案）
         -PassThru     → 返回原始统计对象（供编程使用）
         -NoWhitespace → 排除空格、制表符、换行等空白字符再统计
         -Help → 显示完整帮助（等同 Get-Help -Full）
