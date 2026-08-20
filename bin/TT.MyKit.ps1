@@ -218,8 +218,10 @@ function __MyKit_BuildScriptInfo {
     $content = ''
     try { $content = Get-Content -Path $File.FullName -Raw -ErrorAction Stop } catch { }
     $cat = $Category
-    # 从 TT.<Category>.xxx 推断分类（优先）
-    if ($File.Name -match '^TT\.(\w+)\.') { $cat = $Matches[1].ToLower() }
+    # 从 TT.<Category>.xxx 推断分类（仅当目录级分类为空时使用，避免 _init 下的 TT.Home.Init 被误判为 home 分类）
+    if ([string]::IsNullOrEmpty($cat) -and $File.Name -match '^TT\.(\w+)\.') {
+        $cat = $Matches[1].ToLower()
+    }
     return [PSCustomObject]@{
         Path             = $File.FullName
         Name             = $File.Name
@@ -238,18 +240,12 @@ function __MyKit_ScanScripts {
     )
     $scripts = @()
 
-    # 扫描根目录（bin/）下的 TT.*.ps1（扁平脚本，P2 迁移前兼容）
-    $rootFiles = Get-ChildItem -Path $RootDir -Filter 'TT.*.ps1' -File -ErrorAction SilentlyContinue
-    foreach ($f in $rootFiles) {
-        if ($f.Name -eq 'TT.MyKit.ps1') { continue }
-        $scripts += __MyKit_BuildScriptInfo -File $f -Category ''
-    }
-
-    # 扫描子目录
+    # 扫描子目录（排除 _core 和隐藏目录）
     $subDirs = Get-ChildItem -Path $RootDir -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne '_core' -and $_.Name -notlike '.*' }
     foreach ($dir in $subDirs) {
-        $catName = $dir.Name.ToLower()
+        # _init 目录分类名设为 init
+        $catName = if ($dir.Name -eq '_init') { 'init' } else { $dir.Name.ToLower() }
         $files = Get-ChildItem -Path $dir.FullName -Filter '*.ps1' -File -ErrorAction SilentlyContinue
         foreach ($f in $files) {
             $scripts += __MyKit_BuildScriptInfo -File $f -Category $catName
@@ -318,7 +314,7 @@ function Get-MyKitCategory {
 
     $results = @()
     foreach ($cat in $cats) {
-        $count = ($allScripts | Where-Object { $_.Category -eq $cat }).Count
+        $count = @($allScripts | Where-Object { $_.Category -eq $cat }).Count
         $results += [PSCustomObject]@{
             Category  = $cat
             Commands  = $count

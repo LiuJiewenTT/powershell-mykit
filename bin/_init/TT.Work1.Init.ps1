@@ -2,7 +2,7 @@
 
 function Work1-NetInit {
     $directory = $PSScriptRoot
-    $childpath = "TT.NetIP.utils.ps1"
+    $childpath = "..\net\TT.NetIP.Utils.ps1"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     . $filepath
     
@@ -14,7 +14,7 @@ function Work1-NetInit {
 
 function Work1-NetSaveFile {
     $directory = $PSScriptRoot
-    $childpath = "TT.NetIP.utils.ps1"
+    $childpath = "..\net\TT.NetIP.Utils.ps1"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     . $filepath
     

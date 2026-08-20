@@ -1,4 +1,5 @@
-﻿# 显示当前目录
+﻿# @archived
+# 显示当前目录
 $CurrentPath = Get-Location
 Write-Host "`n🔍 当前目录是: $CurrentPath`n"
 

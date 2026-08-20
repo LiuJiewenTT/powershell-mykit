@@ -21,7 +21,7 @@ try {
 . "$mykit_dir\TT.MyKit.ps1"
 
 # ─── 保留兼容：旧的 Import-ScriptFunctions ───────────────
-. "$mykit_dir\TT.LoadScript.utils.ps1"
+. "$mykit_dir\_core\TT.LoadScript.Utils.ps1"
 
 
 function profile_home {
@@ -38,7 +38,7 @@ function profile_work {
 
 
 function ishome {
-    $init_file = "TT.Home.init.ps1"
+    $init_file = "_init\TT.Home.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
@@ -50,7 +50,7 @@ function ishome {
 
 
 function isnormal {
-    $init_file = "TT.Normal.init.ps1"
+    $init_file = "_init\TT.Normal.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
@@ -62,7 +62,7 @@ function isnormal {
 
 
 function iswork {
-    $init_file = "TT.Work1.init.ps1"
+    $init_file = "_init\TT.Work1.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"

@@ -1,20 +1,20 @@
 ﻿
 
-function Home-NetInit {
+function Normal-NetInit {
     $directory = $PSScriptRoot
-    $childpath = "TT.NetIP.utils.ps1"
+    $childpath = "..\net\TT.NetIP.Utils.ps1"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     . $filepath
     
-    $childpath = "TT.Home.net_config_${adapterId}.json"
+    $childpath = "TT.Normal.net_config_${adapterId}.json"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     Restore-NetworkConfiguration -FilePath $filepath
 }
 
 
-function Home-NetSaveFile {
+function Normal-NetSaveFile {
     $directory = $PSScriptRoot
-    $childpath = "TT.NetIP.utils.ps1"
+    $childpath = "..\net\TT.NetIP.Utils.ps1"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     . $filepath
     
@@ -50,13 +50,13 @@ function Home-NetSaveFile {
     $adapterId = $adapters[[int]$selection-1].ifIndex
     
     # Save configuration
-    $childpath = "TT.Home.net_config_${adapterId}.json"
+    $childpath = "TT.Normal.net_config_${adapterId}.json"
     $filepath = Join-Path -Path $directory -ChildPath $childpath
     Write-Host "正在保存配置到文件: $filepath"
     Save-NetworkConfiguration -FilePath $filepath -InterfaceAlias $selectedAdapter
 }
 
 
-function Home-Init-Imported {
+function Normal-Init-Imported {
     echo true
 }
