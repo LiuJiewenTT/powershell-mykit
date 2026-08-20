@@ -1,17 +1,17 @@
 ﻿<#
 .SYNOPSIS
-    Git 暂存区拆分提交工具 - 按字节大小自动分批提交（支持 hunk 级及行级切分）
+    Git 暂存区拆分提交工具 - 按字节和/或行数自动分批提交（支持 hunk 级及行级切分）
 .DESCRIPTION
-    将当前暂存区（staged）的变更按 UTF-8 字节大小拆分为多个提交，
-    每个提交不超过指定字节上限。提交注释自动追加序号后缀。
+    将当前暂存区（staged）的变更按 UTF-8 字节大小和/或新增行数拆分为多个提交，
+    每个提交不超过指定上限。提交注释自动追加序号后缀。
 
       用户命令:
-        Split-GitStagedCommit - 将暂存区按字节大小拆分为多个提交
+        Split-GitStagedCommit - 将暂存区按字节/行数拆分为多个提交
 
     工作流程:
       1. 获取暂存区文件列表（git diff --cached --name-only）
-      2. 逐文件计算 UTF-8 新增字节数
-      3. 贪心装箱：累加文件字节，不超过 MaxBytes 则放入当前批，否则新开一批
+      2. 逐文件计算 UTF-8 新增字节数和新增行数
+      3. 贪心装箱：累加文件指标，不超过上限则放入当前批，否则新开一批
       4. 超限文件自动按 hunk 切分，分多次提交
       5. 单个 hunk 超限时，在 hunk 内部按 +行 贪心拆分为多个子 hunk
       6. 逐批提交：整文件用 blob hash + update-index，hunk 切分用 hash-object + update-index
@@ -23,10 +23,16 @@
       - 拆分后的子 hunk 无缝接入现有 hunk 提交流程
 
     参数说明:
-      -MaxBytes    → 每个提交的字节上限（必填，单位：字节）
+      -MaxBytes    → 每个提交的字节上限（可选，与 -MaxLines 至少指定一个，单位：字节）
+      -MaxLines    → 每个提交的新增行数上限（可选，与 -MaxBytes 至少指定一个）
       -Message     → 提交注释前缀（必填），实际注释为 "前缀 #序号"
       -DryRun      → 仅模拟分批结果，不执行 git add / commit
       -Help        → 显示完整帮助（等同 Get-Help -Full）
+
+    双维度限制规则:
+      - 同时指定 -MaxBytes 和 -MaxLines 时，每个提交必须同时满足两个上限（AND 逻辑）
+      - 仅指定 -MaxBytes 时，仅按字节分批（向后兼容）
+      - 仅指定 -MaxLines 时，仅按行数分批
 
     未暂存改动保护:
       - 所有操作仅针对暂存区，不修改工作区文件
@@ -51,10 +57,14 @@
 
     dot-source 加载后可用:
       Split-GitStagedCommit -MaxBytes <字节数> -Message <前缀> [-DryRun] [-Help]
+      Split-GitStagedCommit -MaxLines <行数> -Message <前缀> [-DryRun] [-Help]
+      Split-GitStagedCommit -MaxBytes <字节数> -MaxLines <行数> -Message <前缀> [-DryRun] [-Help]
 .EXAMPLE
     . G:\path\TT.Git.SplitCommit.ps1
     Split-GitStagedCommit -MaxBytes 10240 -Message "feature: 新增模块"
     Split-GitStagedCommit -MaxBytes 5120 -Message "feat" -DryRun
+    Split-GitStagedCommit -MaxLines 500 -Message "refactor: 重构"
+    Split-GitStagedCommit -MaxBytes 10240 -MaxLines 300 -Message "feat"
     Split-GitStagedCommit -MaxBytes 10000 -Message "refactor" -Help
 #>
 
@@ -65,6 +75,9 @@ param(
 
     [Parameter(Position = 1)]
     [string]$Message,
+
+    [Parameter()]
+    [int]$MaxLines,
 
     [switch]$DryRun,
 
@@ -259,6 +272,61 @@ function __GitSplit_GetFileBytes {
 }
 
 
+# 计算文件的新增行数（+ 行数，排除 +++ 头部行）
+function __GitSplit_GetFileLines {
+    param([string]$FilePath)
+
+    $diff = __GitSplit_GetDiffLines -FilePath $FilePath -U0
+    if ($null -eq $diff -or $diff.Count -eq 0) {
+        return 0
+    }
+
+    $addLines = 0
+    foreach ($line in $diff) {
+        if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
+            $addLines++
+        }
+    }
+
+    return $addLines
+}
+
+
+# 判断单个文件/批次是否超过限制上限（双维度：字节 + 行数）
+# 任意一个指定维度超过即返回 $true
+# MaxBytes/MaxLines 为 0 或未指定时该维度不检查
+function __GitSplit_ExceedsLimit {
+    param(
+        [long]$Bytes,
+        [int]$Lines,
+        [long]$MaxBytes,
+        [int]$MaxLines
+    )
+
+    if ($MaxBytes -gt 0 -and $Bytes -gt $MaxBytes) { return $true }
+    if ($MaxLines -gt 0 -and $Lines -gt $MaxLines) { return $true }
+    return $false
+}
+
+
+# 判断将新指标累加到当前批次后是否仍在限制范围内（双维度 AND 逻辑）
+# 两个维度都必须满足才返回 $true；未指定的维度（值 0）自动满足
+function __GitSplit_FitsInBatch {
+    param(
+        [long]$CurrentBytes,
+        [int]$CurrentLines,
+        [long]$AddBytes,
+        [int]$AddLines,
+        [long]$MaxBytes,
+        [int]$MaxLines
+    )
+
+    if ($MaxBytes -gt 0 -and ($CurrentBytes + $AddBytes) -gt $MaxBytes) { return $false }
+    if ($MaxLines -gt 0 -and ($CurrentLines + $AddLines) -gt $MaxLines) { return $false }
+    return $true
+}
+
+
 # 检查文件是否为二进制文件
 function __GitSplit_IsBinaryFile {
     param([string]$FilePath)
@@ -347,6 +415,7 @@ function __GitSplit_ParseEolsFromBytes {
 #   AtHeader    @@ 行
 #   Lines       hunk 的所有 diff 行（- + \ No newline）
 #   AddBytes    +行 UTF-8 字节数
+#   AddLines    +行 行数
 #   OldStart    旧行起始号（1-based，0 表示新文件）
 #   OldCount    旧行数
 #   NoNewlineOld  旧版本末尾无换行
@@ -368,6 +437,7 @@ function __GitSplit_ParseHunks {
     $currentHunkLines = [System.Collections.ArrayList]::new()
     $currentAtHeader = ""
     $currentAddBytes = 0
+    $currentAddLines = 0
     $inHunk = $false
     $lineIndex = 0
 
@@ -378,11 +448,12 @@ function __GitSplit_ParseHunks {
         if ($line -match '^@@') {
             # 遇到新 @@ 头，保存上一个 hunk
             if ($inHunk -and $currentHunkLines.Count -gt 0) {
-                $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes))
+                $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes $currentAddLines))
             }
             $currentAtHeader = $line
             $currentHunkLines = [System.Collections.ArrayList]::new()
             $currentAddBytes = 0
+            $currentAddLines = 0
             $inHunk = $true
             continue
         }
@@ -391,13 +462,14 @@ function __GitSplit_ParseHunks {
             $null = $currentHunkLines.Add($line)
             if ($line -match '^\+' -and $line -notmatch '^\+{3}') {
                 $currentAddBytes += $utf8.GetByteCount($line.Substring(1))
+                $currentAddLines++
             }
         }
     }
 
     # 保存最后一个 hunk
     if ($inHunk -and $currentHunkLines.Count -gt 0) {
-        $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes))
+        $null = $hunks.Add((__GitSplit_FinalizeHunk $currentAtHeader $currentHunkLines $currentAddBytes $currentAddLines))
     }
 
     # 逗号前缀防止 PS 5.1 管道展平空数组为 $null
@@ -407,7 +479,7 @@ function __GitSplit_ParseHunks {
 
 # 从 @@ 头和 diff 行构建 hunk 对象
 function __GitSplit_FinalizeHunk {
-    param([string]$AtHeader, [System.Collections.ArrayList]$Lines, [long]$AddBytes)
+    param([string]$AtHeader, [System.Collections.ArrayList]$Lines, [long]$AddBytes, [int]$AddLines)
 
     # 解析 @@ -oldStart[,oldCount] +newStart[,newCount] @@
     $oldStart = 0
@@ -433,6 +505,7 @@ function __GitSplit_FinalizeHunk {
         AtHeader     = $AtHeader
         Lines        = $Lines.ToArray()
         AddBytes     = $AddBytes
+        AddLines     = $AddLines
         OldStart     = $oldStart
         OldCount     = $oldCount
         NoNewlineOld = $noNewlineOld
@@ -444,7 +517,8 @@ function __GitSplit_FinalizeHunk {
 # 将超限的单个 hunk 按 +行 贪心拆分为多个子 hunk
 # 参数:
 #   Hunk       待拆分的 hunk 对象（来自 __GitSplit_ParseHunks / __GitSplit_FinalizeHunk）
-#   MaxBytes   每个子 hunk 的字节上限
+#   MaxBytes   每个子 hunk 的字节上限（0 表示不限制）
+#   MaxLines   每个子 hunk 的行数上限（0 表示不限制）
 #   TargetEols 目标文件（暂存区内容）的逐行行尾数组，可选
 #              如果提供，为每个子 hunk 的 +行生成 EolHints（目标文件的行尾参考）
 # 返回: 子 hunk 数组（每个子 hunk 都是标准的 hunk 对象，可能含 EolHints 属性）
@@ -465,6 +539,7 @@ function __GitSplit_SplitSingleHunk {
     param(
         [object]$Hunk,
         [long]$MaxBytes,
+        [int]$MaxLines,
         [string[]]$TargetEols
     )
 
@@ -494,31 +569,36 @@ function __GitSplit_SplitSingleHunk {
         return ,@($Hunk)
     }
 
-    # 贪心分组：将 + 行按 MaxBytes 分成多组
-    # 每组: @{ StartIndex, Count, Bytes }
+    # 贪心分组：将 + 行按 MaxBytes/MaxLines 分成多组
+    # 每组: @{ StartIndex, Count, Bytes, Lines }
+    # 双维度：两个上限都必须满足才可累加到当前组
     $groups = [System.Collections.ArrayList]::new()
     $gStart = 0
     $gBytes = 0
+    $gLines = 0
 
     for ($i = 0; $i -lt $addLines.Count; $i++) {
         $lb = $addLineBytes[$i]
         if ($gStart -eq $i) {
             # 当前组的第一行，必须放入（即使超限）
             $gBytes = $lb
+            $gLines = 1
         }
-        elseif ($gBytes + $lb -le $MaxBytes) {
+        elseif (__GitSplit_FitsInBatch -CurrentBytes $gBytes -CurrentLines $gLines -AddBytes $lb -AddLines 1 -MaxBytes $MaxBytes -MaxLines $MaxLines) {
             $gBytes += $lb
+            $gLines++
         }
         else {
             # 结束当前组，开新组
-            $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $i - $gStart; Bytes = $gBytes })
+            $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $i - $gStart; Bytes = $gBytes; Lines = $gLines })
             $gStart = $i
             $gBytes = $lb
+            $gLines = 1
         }
     }
     # 最后一组
     if ($gStart -lt $addLines.Count) {
-        $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $addLines.Count - $gStart; Bytes = $gBytes })
+        $null = $groups.Add([PSCustomObject]@{ StartIndex = $gStart; Count = $addLines.Count - $gStart; Bytes = $gBytes; Lines = $gLines })
     }
 
     # 只分出1组 → 无需拆分
@@ -636,6 +716,7 @@ function __GitSplit_SplitSingleHunk {
             AtHeader     = $atHeader
             Lines        = $subLines.ToArray()
             AddBytes     = $subAddBytes
+            AddLines     = $g.Count
             OldStart     = $subOldStart
             OldCount     = $subOldCount
             NoNewlineOld = ($gi -eq 0 -and $Hunk.NoNewlineOld -and $groups.Count -gt 1)
@@ -652,13 +733,14 @@ function __GitSplit_SplitSingleHunk {
 
 
 # 将超限文件按 hunk 贪心分批
-# 每个 hunk batch 包含: FilePath, Hunks, AddBytes
+# 每个 hunk batch 包含: FilePath, Hunks, AddBytes, AddLines
 # 对超限的单个 hunk，调用 __GitSplit_SplitSingleHunk 按行拆分
 # TargetEols: 目标文件（暂存区内容）的逐行行尾数组，可选
 function __GitSplit_SplitFileByHunks {
     param(
         [string]$FilePath,
         [long]$MaxBytes,
+        [int]$MaxLines,
         [string[]]$TargetEols
     )
 
@@ -667,11 +749,11 @@ function __GitSplit_SplitFileByHunks {
         return ,@()
     }
 
-    # 对超限的单个 hunk 按行拆分
+    # 对超限的单个 hunk 按行拆分（双维度检查）
     $expandedHunks = [System.Collections.ArrayList]::new()
     foreach ($hunk in $hunks) {
-        if ($hunk.AddBytes -gt $MaxBytes) {
-            $subHunks = __GitSplit_SplitSingleHunk -Hunk $hunk -MaxBytes $MaxBytes -TargetEols $TargetEols
+        if (__GitSplit_ExceedsLimit -Bytes $hunk.AddBytes -Lines $hunk.AddLines -MaxBytes $MaxBytes -MaxLines $MaxLines) {
+            $subHunks = __GitSplit_SplitSingleHunk -Hunk $hunk -MaxBytes $MaxBytes -MaxLines $MaxLines -TargetEols $TargetEols
             foreach ($sh in $subHunks) {
                 $null = $expandedHunks.Add($sh)
             }
@@ -685,27 +767,32 @@ function __GitSplit_SplitFileByHunks {
     $hunkBatches = [System.Collections.ArrayList]::new()
     $currentHunks = [System.Collections.ArrayList]::new()
     $currentBytes = 0
+    $currentLines = 0
 
     foreach ($hunk in $expandedHunks) {
         if ($currentHunks.Count -eq 0) {
             $null = $currentHunks.Add($hunk)
             $currentBytes = $hunk.AddBytes
+            $currentLines = $hunk.AddLines
             continue
         }
 
-        if ($currentBytes + $hunk.AddBytes -le $MaxBytes) {
+        if (__GitSplit_FitsInBatch -CurrentBytes $currentBytes -CurrentLines $currentLines -AddBytes $hunk.AddBytes -AddLines $hunk.AddLines -MaxBytes $MaxBytes -MaxLines $MaxLines) {
             $null = $currentHunks.Add($hunk)
             $currentBytes += $hunk.AddBytes
+            $currentLines += $hunk.AddLines
         }
         else {
             $null = $hunkBatches.Add([PSCustomObject]@{
                 FilePath = $FilePath
                 Hunks    = $currentHunks.ToArray()
                 AddBytes = $currentBytes
+                AddLines = $currentLines
             })
             $currentHunks = [System.Collections.ArrayList]::new()
             $null = $currentHunks.Add($hunk)
             $currentBytes = $hunk.AddBytes
+            $currentLines = $hunk.AddLines
         }
     }
 
@@ -714,6 +801,7 @@ function __GitSplit_SplitFileByHunks {
             FilePath = $FilePath
             Hunks    = $currentHunks.ToArray()
             AddBytes = $currentBytes
+            AddLines = $currentLines
         })
     }
 
@@ -722,49 +810,57 @@ function __GitSplit_SplitFileByHunks {
 }
 
 
-# 贪心装箱：将文件列表按字节上限分批
+# 贪心装箱：将文件列表按字节/行数上限分批（双维度 AND 逻辑）
 function __GitSplit_GreedyPack {
     param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
+        [Parameter()]
         [object[]]$FileList,
 
-        [Parameter(Mandatory)]
-        [long]$MaxBytes
+        [Parameter()]
+        [long]$MaxBytes,
+
+        [Parameter()]
+        [int]$MaxLines
     )
 
     if (-not $FileList -or $FileList.Count -eq 0) {
         return ,@()
     }
 
-    $fileBytes = @()
+    $fileStats = @()
     foreach ($f in $FileList) {
         $bytes = __GitSplit_GetFileBytes -FilePath $f
-        $fileBytes += [PSCustomObject]@{
+        $lines = __GitSplit_GetFileLines -FilePath $f
+        $fileStats += [PSCustomObject]@{
             Path  = $f
             Bytes = $bytes
+            Lines = $lines
         }
     }
 
     $batches = @()
     $currentBatch = @()
     $currentBytes = 0
+    $currentLines = 0
 
-    foreach ($fb in $fileBytes) {
+    foreach ($fs in $fileStats) {
         if ($currentBatch.Count -eq 0) {
-            $currentBatch += $fb.Path
-            $currentBytes = $fb.Bytes
+            $currentBatch += $fs.Path
+            $currentBytes = $fs.Bytes
+            $currentLines = $fs.Lines
             continue
         }
 
-        if ($currentBytes + $fb.Bytes -le $MaxBytes) {
-            $currentBatch += $fb.Path
-            $currentBytes += $fb.Bytes
+        if (__GitSplit_FitsInBatch -CurrentBytes $currentBytes -CurrentLines $currentLines -AddBytes $fs.Bytes -AddLines $fs.Lines -MaxBytes $MaxBytes -MaxLines $MaxLines) {
+            $currentBatch += $fs.Path
+            $currentBytes += $fs.Bytes
+            $currentLines += $fs.Lines
         }
         else {
             $batches += ,@($currentBatch)
-            $currentBatch = @($fb.Path)
-            $currentBytes = $fb.Bytes
+            $currentBatch = @($fs.Path)
+            $currentBytes = $fs.Bytes
+            $currentLines = $fs.Lines
         }
     }
 
@@ -1177,10 +1273,10 @@ function __GitSplit_WriteHeader {
 function Split-GitStagedCommit {
     <#
     .SYNOPSIS
-        将暂存区按字节大小拆分为多个提交（支持 hunk 级及行级切分）
+        将暂存区按字节/行数拆分为多个提交（支持 hunk 级及行级切分）
     .DESCRIPTION
-        获取暂存区所有文件，按 UTF-8 新增字节贪心分批，
-        每批不超过 -MaxBytes 指定的上限，提交注释自动追加 #序号。
+        获取暂存区所有文件，按 UTF-8 新增字节和/或新增行数贪心分批，
+        每批不超过 -MaxBytes 和/或 -MaxLines 指定的上限，提交注释自动追加 #序号。
         超限文件自动按 hunk 切分，分多次提交。
         单个 hunk 超限时，在 hunk 内部按 +行 贪心拆分为多个子 hunk（行级切分）。
 
@@ -1192,6 +1288,8 @@ function Split-GitStagedCommit {
     .EXAMPLE
         Split-GitStagedCommit -MaxBytes 10240 -Message "feature: 新增模块"
         Split-GitStagedCommit -MaxBytes 5120 -Message "feat" -DryRun
+        Split-GitStagedCommit -MaxLines 500 -Message "refactor: 重构"
+        Split-GitStagedCommit -MaxBytes 10240 -MaxLines 300 -Message "feat"
         Split-GitStagedCommit -MaxBytes 10000 -Message "refactor" -Help
     #>
     [CmdletBinding()]
@@ -1201,6 +1299,9 @@ function Split-GitStagedCommit {
 
         [Parameter(Position = 1)]
         [string]$Message,
+
+        [Parameter()]
+        [int]$MaxLines,
 
         [switch]$DryRun,
 
@@ -1229,8 +1330,17 @@ function Split-GitStagedCommit {
     try {
     if (-not (__GitSplit_HasStagedChanges)) { return }
 
-    if ($MaxBytes -le 0) {
-        Write-Host "错误：-MaxBytes 必须大于 0" -ForegroundColor Red
+    # 参数验证：-MaxBytes 和 -MaxLines 至少指定一个
+    if ($MaxBytes -le 0 -and $MaxLines -le 0) {
+        Write-Host "错误：-MaxBytes 和 -MaxLines 至少需要指定一个且大于 0" -ForegroundColor Red
+        return
+    }
+    if ($MaxBytes -lt 0) {
+        Write-Host "错误：-MaxBytes 不能为负数" -ForegroundColor Red
+        return
+    }
+    if ($MaxLines -lt 0) {
+        Write-Host "错误：-MaxLines 不能为负数" -ForegroundColor Red
         return
     }
     if ([string]::IsNullOrWhiteSpace($Message)) {
@@ -1259,12 +1369,15 @@ function Split-GitStagedCommit {
     }
 
     Write-Host ""
-    Write-Host "暂存区共 $($stagedFiles.Count) 个文件，字节上限: $MaxBytes" -ForegroundColor Cyan
+    $limitDesc = @()
+    if ($MaxBytes -gt 0) { $limitDesc += "字节上限: $MaxBytes" }
+    if ($MaxLines -gt 0) { $limitDesc += "行数上限: $MaxLines" }
+    Write-Host "暂存区共 $($stagedFiles.Count) 个文件，$($limitDesc -join '，')" -ForegroundColor Cyan
     Write-Host "提交注释前缀: $Message" -ForegroundColor Cyan
     Write-Host ""
 
     # 贪心分批
-    $batches = __GitSplit_GreedyPack -FileList $stagedFiles -MaxBytes $MaxBytes
+    $batches = __GitSplit_GreedyPack -FileList $stagedFiles -MaxBytes $MaxBytes -MaxLines $MaxLines
 
     if ($batches.Count -eq 0) {
         Write-Host "没有可分批的文件" -ForegroundColor Yellow
@@ -1278,11 +1391,13 @@ function Split-GitStagedCommit {
     for ($i = 0; $i -lt $batches.Count; $i++) {
         $batch = $batches[$i]
         $batchBytes = 0
+        $batchLines = 0
         foreach ($f in $batch) {
             $batchBytes += __GitSplit_GetFileBytes -FilePath $f
+            $batchLines += __GitSplit_GetFileLines -FilePath $f
         }
 
-        if ($batchBytes -le $MaxBytes) {
+        if (-not (__GitSplit_ExceedsLimit -Bytes $batchBytes -Lines $batchLines -MaxBytes $MaxBytes -MaxLines $MaxLines)) {
             # 整文件批次
             $fileInfos = [System.Collections.ArrayList]::new()
             foreach ($f in $batch) {
@@ -1297,6 +1412,7 @@ function Split-GitStagedCommit {
                 Files     = @($batch)
                 FileInfos = $fileInfos.ToArray()
                 Bytes     = $batchBytes
+                Lines     = $batchLines
                 Seq       = $seq
                 CommitMsg = "$Message #$seq"
             })
@@ -1305,14 +1421,16 @@ function Split-GitStagedCommit {
             # 超限文件需逐个处理
             foreach ($f in $batch) {
                 $fileBytes = __GitSplit_GetFileBytes -FilePath $f
+                $fileLines = __GitSplit_GetFileLines -FilePath $f
 
-                if ($fileBytes -le $MaxBytes) {
+                if (-not (__GitSplit_ExceedsLimit -Bytes $fileBytes -Lines $fileLines -MaxBytes $MaxBytes -MaxLines $MaxLines)) {
                     $seq++
                     $null = $commitPlan.Add([PSCustomObject]@{
                         Type      = 'files'
                         Files     = @($f)
                         FileInfos = @($stagedInfo[$f])
                         Bytes     = $fileBytes
+                        Lines     = $fileLines
                         Seq       = $seq
                         CommitMsg = "$Message #$seq"
                     })
@@ -1327,6 +1445,7 @@ function Split-GitStagedCommit {
                         Files     = @($f)
                         FileInfos = @($stagedInfo[$f])
                         Bytes     = $fileBytes
+                        Lines     = $fileLines
                         Seq       = $seq
                         CommitMsg = "$Message #$seq"
                         Note      = "二进制文件，无法按 hunk 切分，独立提交"
@@ -1339,7 +1458,7 @@ function Split-GitStagedCommit {
                 $stagedContentBytes = __GitSplit_GetStagedContentBytes -FilePath $f
                 $targetEols = __GitSplit_ParseEolsFromBytes -Bytes $stagedContentBytes
 
-                $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes -TargetEols $targetEols
+                $hunkBatches = __GitSplit_SplitFileByHunks -FilePath $f -MaxBytes $MaxBytes -MaxLines $MaxLines -TargetEols $targetEols
                 $fMode = if ($null -ne $stagedInfo[$f]) { $stagedInfo[$f].Mode } else { '100644' }
 
                 if ($hunkBatches.Count -le 1 -and $hunkBatches[0].Hunks.Count -le 1) {
@@ -1350,6 +1469,7 @@ function Split-GitStagedCommit {
                         Files     = @($f)
                         FileInfos = @($stagedInfo[$f])
                         Bytes     = $fileBytes
+                        Lines     = $fileLines
                         Seq       = $seq
                         CommitMsg = "$Message #$seq"
                         Note      = "超限但仅1个hunk/子hunk，整文件提交"
@@ -1363,8 +1483,8 @@ function Split-GitStagedCommit {
                     # 构建展开后的 AllHunks（超限 hunk 替换为子 hunk）
                     $expandedAllHunks = [System.Collections.ArrayList]::new()
                     foreach ($hk in (__GitSplit_ParseHunks -FilePath $f)) {
-                        if ($hk.AddBytes -gt $MaxBytes) {
-                            foreach ($sh in (__GitSplit_SplitSingleHunk -Hunk $hk -MaxBytes $MaxBytes -TargetEols $targetEols)) {
+                        if (__GitSplit_ExceedsLimit -Bytes $hk.AddBytes -Lines $hk.AddLines -MaxBytes $MaxBytes -MaxLines $MaxLines) {
+                            foreach ($sh in (__GitSplit_SplitSingleHunk -Hunk $hk -MaxBytes $MaxBytes -MaxLines $MaxLines -TargetEols $targetEols)) {
                                 $null = $expandedAllHunks.Add($sh)
                             }
                         }
@@ -1387,6 +1507,7 @@ function Split-GitStagedCommit {
                             OrigHeadBytes  = $origHeadBytes
                             Hunks          = $hb.Hunks
                             Bytes          = $hb.AddBytes
+                            Lines          = $hb.AddLines
                             Seq            = $seq
                             CommitMsg      = "$Message #$seq"
                             Note           = "hunk 切分为 $($hunkBatches.Count) 批（含行切分）"
@@ -1401,14 +1522,20 @@ function Split-GitStagedCommit {
     __GitSplit_WriteHeader -Title "提交计划（共 $($commitPlan.Count) 批）" -Color Cyan
 
     $totalBytes = 0
+    $totalLines = 0
     foreach ($item in $commitPlan) {
         Write-Host "  批次 $($item.Seq) / $($commitPlan.Count)  提交注释: $($item.CommitMsg)" -ForegroundColor Yellow
-        Write-Host "  字节: $($item.Bytes)" -ForegroundColor Gray
+        $lineInfo = @()
+        $lineInfo += "$($item.Bytes) bytes"
+        if ($MaxLines -gt 0) { $lineInfo += "$($item.Lines) lines" }
+        Write-Host "  $($lineInfo -join ', ')" -ForegroundColor Gray
         if ($item.Type -eq 'files') {
             Write-Host "  文件数: $($item.Files.Count)" -ForegroundColor Gray
             foreach ($f in $item.Files) {
                 $fb = __GitSplit_GetFileBytes -FilePath $f
-                Write-Host "    $f  ($fb bytes)" -ForegroundColor DarkGray
+                $fl = if ($MaxLines -gt 0) { __GitSplit_GetFileLines -FilePath $f } else { 0 }
+                $detail = if ($MaxLines -gt 0) { "$fb bytes, $fl lines" } else { "$fb bytes" }
+                Write-Host "    $f  ($detail)" -ForegroundColor DarkGray
             }
         }
         else {
@@ -1420,9 +1547,15 @@ function Split-GitStagedCommit {
         }
         Write-Host ""
         $totalBytes += $item.Bytes
+        $totalLines += $item.Lines
     }
 
-    Write-Host "  总计: $($stagedFiles.Count) 个文件, $totalBytes 字节, $($commitPlan.Count) 批" -ForegroundColor Green
+    $summaryParts = @()
+    $summaryParts += "$($stagedFiles.Count) 个文件"
+    $summaryParts += "$totalBytes 字节"
+    if ($MaxLines -gt 0) { $summaryParts += "$totalLines 行" }
+    $summaryParts += "$($commitPlan.Count) 批"
+    Write-Host "  总计: $($summaryParts -join ', ')" -ForegroundColor Green
     Write-Host ""
 
     # ---- DryRun 模式 ----
@@ -1471,7 +1604,10 @@ function Split-GitStagedCommit {
         $item = $commitPlan[$i]
 
         Write-Host "  [$($item.Seq)/$($commitPlan.Count)] 提交: $($item.CommitMsg)" -ForegroundColor Yellow
-        Write-Host "    字节: $($item.Bytes)" -ForegroundColor Gray
+        $lineInfo = @()
+        $lineInfo += "$($item.Bytes) bytes"
+        if ($MaxLines -gt 0) { $lineInfo += "$($item.Lines) lines" }
+        Write-Host "    $($lineInfo -join ', ')" -ForegroundColor Gray
 
         $success = $false
 
