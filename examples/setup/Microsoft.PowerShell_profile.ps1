@@ -1,6 +1,5 @@
 ﻿$mykit_dir = "G:\TT.OS.ToolKit\Windows\powershell-mykit\bin\"
 Write-Host "`$mykit_dir=${mykit_dir}"
-# . "${mykit_dir}load_powershell_mykit.bat"
 $env:PATH += ";$mykit_dir"
 
 try {
@@ -15,7 +14,14 @@ try {
 
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-. "TT.LoadScript.utils.ps1"
+# ─── 加载工具箱入口 ──────────────────────────────────────
+# dot-source 加载后即可使用：Get-MyKitCommand, Import-MyKit, Get-MyKitCategory
+# 如需自动导入全部工具，取消下行注释：
+# Import-MyKit -All
+. "$mykit_dir\TT.MyKit.ps1"
+
+# ─── 保留兼容：旧的 Import-ScriptFunctions ───────────────
+. "$mykit_dir\TT.LoadScript.utils.ps1"
 
 
 function profile_home {
