@@ -969,8 +969,13 @@ function __GitSplit_ApplyHunksToContent {
         # 空 HEAD（新文件），无行
     }
     else {
-        # 字节转字符串
-        $content = $utf8NoBom.GetString($HeadBytes)
+        # 字节转字符串。若含 BOM 先剥离（起始偏移 3），避免 BOM 被当作第一行内容解析；
+        # 重建内容时会根据 $hasBom 恢复 BOM（见下方"恢复 BOM"逻辑），防止 BOM 重复
+        $content = if ($hasBom) {
+            $utf8NoBom.GetString($HeadBytes, 3, $HeadBytes.Length - 3)
+        } else {
+            $utf8NoBom.GetString($HeadBytes)
+        }
 
         $lineStart = 0
         $len = $content.Length
