@@ -218,7 +218,7 @@ function __MyKit_BuildScriptInfo {
     $content = ''
     try { $content = Get-Content -Path $File.FullName -Raw -ErrorAction Stop } catch { }
     $cat = $Category
-    # 从 TT.<Category>.xxx 推断分类（仅当目录级分类为空时使用，避免 _init 下的 TT.Home.Init 被误判为 home 分类）
+#   - 从 TT.<Category>.xxx 推断分类（仅当目录级分类为空时使用，避免 _sceneinit 下的 TT.Home.Init 被误判为 home 分类）
     if ([string]::IsNullOrEmpty($cat) -and $File.Name -match '^TT\.(\w+)\.') {
         $cat = $Matches[1].ToLower()
     }
@@ -244,8 +244,8 @@ function __MyKit_ScanScripts {
     $subDirs = Get-ChildItem -Path $RootDir -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne '_core' -and $_.Name -notlike '.*' }
     foreach ($dir in $subDirs) {
-        # _init 目录分类名设为 init
-        $catName = if ($dir.Name -eq '_init') { 'init' } else { $dir.Name.ToLower() }
+        # _sceneinit 目录分类名设为 sceneinit
+        $catName = if ($dir.Name -eq '_sceneinit') { 'sceneinit' } else { $dir.Name.ToLower() }
         $files = Get-ChildItem -Path $dir.FullName -Filter '*.ps1' -File -ErrorAction SilentlyContinue
         foreach ($f in $files) {
             $scripts += __MyKit_BuildScriptInfo -File $f -Category $catName
@@ -518,10 +518,12 @@ function Import-MyKit {
     # 筛选目标，同时过滤无法 dot-source 导入的脚本
     #   - 无函数定义：纯直接执行型
     #   - 有函数定义 + 有脚本级直接执行代码：混合型（dot-source 会触发脚本级代码）
-    #   两种都跳过，避免导入时卡死
+    #   - sceneinit 分类：互斥场景初始化脚本，不能同时导入
+    #   以上均跳过
     $targets = @()
     $skippedDirect = @()
     $skippedMixed = @()
+    $skippedInit = @()
     if ($All) {
         $candidates = @($allScripts | Where-Object { -not $_.IsArchived })
     } else {
@@ -535,6 +537,8 @@ function Import-MyKit {
             $skippedDirect += $c
         } elseif ($c.HasDirectExecute) {
             $skippedMixed += $c
+        } elseif ($c.Category -eq 'sceneinit') {
+            $skippedInit += $c
         } else {
             $targets += $c
         }
@@ -552,6 +556,12 @@ function Import-MyKit {
             Write-Host ("发现 {0} 个混合型脚本（有函数定义但也有脚本级直接执行代码，dot-source 会触发执行）:" -f $skippedMixed.Count) -ForegroundColor DarkYellow
             foreach ($s in $skippedMixed) {
                 Write-Host ("  {0}" -f $s.Name)
+            }
+        }
+        if ($skippedInit.Count -gt 0) {
+            Write-Host ("发现 {0} 个场景初始化脚本（互斥，不能同时导入，需手动 dot-source 加载）:" -f $skippedInit.Count) -ForegroundColor DarkYellow
+            foreach ($s in $skippedInit) {
+                Write-Host ("  . {0}" -f $s.Path)
             }
         }
         return
@@ -578,6 +588,13 @@ function Import-MyKit {
             Write-Host ''
             Write-Host ("另跳过 {0} 个混合型脚本（有函数但也有脚本级代码，dot-source 会触发执行）:" -f $skippedMixed.Count) -ForegroundColor DarkYellow
             foreach ($s in $skippedMixed) {
+                Write-Host ("  {0}" -f $s.Name)
+            }
+        }
+        if ($skippedInit.Count -gt 0) {
+            Write-Host ''
+            Write-Host ("另跳过 {0} 个场景初始化脚本（互斥，不能同时导入）:" -f $skippedInit.Count) -ForegroundColor DarkYellow
+            foreach ($s in $skippedInit) {
                 Write-Host ("  {0}" -f $s.Name)
             }
         }
@@ -613,6 +630,12 @@ function Import-MyKit {
         Write-Host ("已跳过 {0} 个混合型脚本（有函数但也有脚本级代码，dot-source 会触发执行）:" -f $skippedMixed.Count) -ForegroundColor DarkYellow
         foreach ($s in $skippedMixed) {
             Write-Host ("  {0}" -f $s.Name)
+        }
+    }
+    if ($skippedInit.Count -gt 0) {
+        Write-Host ("已跳过 {0} 个场景初始化脚本（互斥，不能同时导入，需手动 dot-source 加载）:" -f $skippedInit.Count) -ForegroundColor DarkYellow
+        foreach ($s in $skippedInit) {
+            Write-Host ("  . {0}" -f $s.Path)
         }
     }
     Write-Host ''

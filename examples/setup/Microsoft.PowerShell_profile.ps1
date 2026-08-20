@@ -38,7 +38,7 @@ function profile_work {
 
 
 function ishome {
-    $init_file = "_init\TT.Home.Init.ps1"
+    $init_file = "_sceneinit\TT.Home.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
@@ -50,7 +50,7 @@ function ishome {
 
 
 function isnormal {
-    $init_file = "_init\TT.Normal.Init.ps1"
+    $init_file = "_sceneinit\TT.Normal.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
@@ -62,7 +62,7 @@ function isnormal {
 
 
 function iswork {
-    $init_file = "_init\TT.Work1.Init.ps1"
+    $init_file = "_sceneinit\TT.Work1.Init.ps1"
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
