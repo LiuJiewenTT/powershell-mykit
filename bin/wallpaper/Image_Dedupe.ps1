@@ -19,8 +19,10 @@ if (-not (Test-Path $QuarantineDir)) {
 Write-Host "`n正在扫描文件并计算MD5哈希，请稍候..." -ForegroundColor Cyan
 
 # 获取指定后缀文件
+# 排除隔离目录：已被移入隔离区的文件不参与重复检测
 $files = Get-ChildItem -Path $ScanPath -File -Recurse:$Recurse | Where-Object {
-    $TargetExts -contains $_.Extension.ToLower()
+    ($TargetExts -contains $_.Extension.ToLower()) -and
+    ($_.FullName -notlike "$QuarantineDir\*")
 }
 
 if ($files.Count -eq 0) {
