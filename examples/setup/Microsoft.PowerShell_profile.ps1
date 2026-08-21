@@ -15,7 +15,7 @@ try {
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ─── 加载工具箱入口 ──────────────────────────────────────
-# dot-source 加载后即可使用：Get-MyKitCommand, Import-MyKit, Get-MyKitCategory
+# dot-source 加载后即可使用：Get-MyKitCommand, Get-MyKitCommandList, Import-MyKit, Get-MyKitCategory
 # 如需自动导入全部工具，取消下行注释：
 # Import-MyKit -All
 . "$mykit_dir\TT.MyKit.ps1"
@@ -66,10 +66,10 @@ function iswork {
 
     $filepath = Join-Path -Path $mykit_dir -ChildPath $init_file
     echo "init_file path: $filepath"
-    Import-ScriptFunctions $filepath
-    # . $filepath
+    # Import-ScriptFunctions $filepath
+    . $filepath
 
-    CTFF-NetInit
+    Work1-NetInit
 }
 
 
