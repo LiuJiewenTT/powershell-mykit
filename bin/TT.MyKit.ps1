@@ -2,10 +2,11 @@
 .SYNOPSIS
     TT.MyKit 工具箱入口 — 导入、浏览、帮助一体化
 .DESCRIPTION
-    提供三个核心命令：
+    提供四个核心命令：
 
       Import-MyKit          按分类或全量导入工具脚本
       Get-MyKitCommand      浏览工具箱命令列表，查看脚本帮助
+      Get-MyKitCommandList  以命令为中心展开列出（每个函数独占一行）
       Get-MyKitCategory     列出所有分类目录
 
     dot-source 加载本脚本即可注册上述命令：
@@ -134,11 +135,26 @@ function __MyKit_ExtractSynopsis {
 }
 
 # ─── 内部辅助：提取文件中定义的 function 名称 ─────────────
+#   用 AST 只搜索顶层函数定义，不递归进函数体内部的嵌套定义
 function __MyKit_ExtractFunctions {
     param([string]$Content)
-    $funcs = [regex]::Matches($Content, '(?mi)^\s*function\s+([A-Za-z][\w.-]+)') |
-        ForEach-Object { $_.Groups[1].Value } |
-        Where-Object { $_ -notmatch '^__' }    # 过滤内部函数（__前缀）
+    $funcs = @()
+    try {
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $Content, [ref]$null, [ref]$null
+        )
+        $funcDefs = $ast.FindAll(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
+            $false
+        )
+        $funcs = $funcDefs | ForEach-Object { $_.Name } |
+            Where-Object { $_ -notmatch '^__' }    # 过滤内部函数（__前缀）
+    } catch {
+        # 解析失败时回退到正则
+        $funcs = [regex]::Matches($Content, '(?mi)^\s*function\s+([A-Za-z][\w.-]+)') |
+            ForEach-Object { $_.Groups[1].Value } |
+            Where-Object { $_ -notmatch '^__' }
+    }
     return $funcs
 }
 
@@ -331,6 +347,168 @@ function Get-MyKitCategory {
     return $results
 }
 
+# ─── 内部辅助：提取各函数的 SYNOPSIS ─────────────────────
+#   用 AST 定位每个函数，提取函数体前方 <# .SYNOPSIS #> 中的内容
+function __MyKit_ExtractFunctionSynopsis {
+    param([string]$Content)
+
+    $result = @{}
+    try {
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+            $Content, [ref]$null, [ref]$null
+        )
+        $lines = $Content -split "`r?`n"
+
+        # 遍历顶层函数定义（不递归进函数体内部，避免嵌套定义重复）
+        $funcDefs = $ast.FindAll(
+            { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
+            $false
+        )
+
+        foreach ($fnDef in $funcDefs) {
+            $fnName = $fnDef.Name
+            # 跳过内部函数
+            if ($fnName -match '^__') { continue }
+
+            # 函数体内部的 help 块（function xxx { <# .SYNOPSIS ... #> ... }）
+            $bodyText = $fnDef.Body.Extent.Text
+            $synopsis = __MyKit_ExtractSynopsis $bodyText
+            $result[$fnName] = $synopsis
+        }
+    } catch {
+        # 解析失败时返回空
+    }
+
+    return $result
+}
+
+# ─── Get-MyKitCommandList ─────────────────────────────────
+#   以命令为中心的展开列表，每个函数/命令独占一行
+function Get-MyKitCommandList {
+    <#
+    .SYNOPSIS
+        以命令为中心列出所有可用命令（每个函数独占一行）
+    .DESCRIPTION
+        无参数时列出全部命令，每个函数/命令独占一行。
+        -Category  按分类筛选，如 git、net、disk
+        -Name      按命令名/脚本名筛选（支持通配符）
+    .EXAMPLE
+        Get-MyKitCommandList
+        Get-MyKitCommandList -Category git
+        Get-MyKitCommandList -Name *Git*
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Category,
+        [string]$Name
+    )
+
+    # 控制台环境检测
+    $envWarnings = __MyKit_CheckConsole
+    foreach ($w in $envWarnings) {
+        Write-Host $w -ForegroundColor DarkYellow
+    }
+
+    $allScripts = __MyKit_ScanScripts -RootDir $script:MyKitRoot
+
+    # 筛选
+    $filtered = $allScripts
+    if ($Category -ne '') {
+        $catLower = $Category.ToLower()
+        $filtered = $filtered | Where-Object { $_.Category -eq $catLower }
+    }
+    if ($Name -ne '') {
+        $filtered = $filtered | Where-Object {
+            ($_.Name -like $Name) -or
+            ($_.Functions -and ($_.Functions | Where-Object { $_ -like $Name }).Count -gt 0)
+        }
+    }
+
+    # 构建命令级列表
+    $results = @()
+    foreach ($item in $filtered) {
+        $funcSynopsis = __MyKit_ExtractFunctionSynopsis -Content (Get-Content -Path $item.Path -Raw -ErrorAction SilentlyContinue)
+
+        if ($item.Functions.Count -gt 0) {
+            $status = if ($global:__TT_MyKit_Loaded.ContainsKey($item.Path.ToLower())) { 'loaded' } else { '--' }
+            if ($item.IsArchived) { $status = 'archived' }
+            if ($item.HasDirectExecute) { $status = 'mixed' }
+            foreach ($fn in $item.Functions) {
+                $synopsis = $funcSynopsis[$fn]
+                if (-not $synopsis) { $synopsis = $item.Synopsis }
+                if (-not $synopsis) { $synopsis = '' }
+                $results += [PSCustomObject]@{
+                    Category = $item.Category
+                    Script   = $item.Name
+                    Status   = $status
+                    Command  = $fn
+                    Synopsis = $synopsis
+                }
+            }
+        } else {
+            # 直接执行型脚本，命令列显示脚本名
+            $status = if ($item.IsArchived) { 'archived' } else { '--' }
+            $results += [PSCustomObject]@{
+                Category = $item.Category
+                Script   = $item.Name
+                Status   = $status
+                Command  = '(直接执行)'
+                Synopsis = $item.Synopsis
+            }
+        }
+    }
+
+    if ($results.Count -eq 0) {
+        Write-Host '未找到匹配的命令。' -ForegroundColor Yellow
+        return
+    }
+
+    # 计算各列显示宽度上限
+    $catW = [Math]::Max(8, ($results | ForEach-Object { __MyKit_DisplayWidth $_.Category } | Measure-Object -Maximum).Maximum)
+    $scrW = [Math]::Max(8, [Math]::Min(35, ($results | ForEach-Object { __MyKit_DisplayWidth $_.Script } | Measure-Object -Maximum).Maximum))
+    $cmdW = [Math]::Max(8, [Math]::Min(40, ($results | ForEach-Object { __MyKit_DisplayWidth $_.Command } | Measure-Object -Maximum).Maximum))
+    $statW = 8
+    $synW = 50
+
+    # 表头
+    Write-Host ''
+    $headerParts = @(
+        (__MyKit_PadRight 'Category' $catW),
+        (__MyKit_PadRight 'Script' $scrW),
+        (__MyKit_PadRight 'Status' $statW),
+        (__MyKit_PadRight 'Command' $cmdW),
+        'Synopsis'
+    )
+    Write-Host ("  " + ($headerParts -join '  ')) -ForegroundColor White
+    $sepLen = $catW + $scrW + $cmdW + $statW + $synW + 8
+    Write-Host ('  ' + ('-' * $sepLen))
+
+    foreach ($r in $results) {
+        $catPad  = __MyKit_PadRight $r.Category $catW
+        $scrPad  = __MyKit_TruncateDisplay $r.Script $scrW
+        $scrPad  = __MyKit_PadRight $scrPad $scrW
+        $statPad = __MyKit_PadRight $r.Status $statW
+        $cmdPad  = __MyKit_TruncateDisplay $r.Command $cmdW
+        $cmdPad  = __MyKit_PadRight $cmdPad $cmdW
+        $synopsis = $r.Synopsis
+        if ((__MyKit_DisplayWidth $synopsis) -gt $synW) { $synopsis = __MyKit_TruncateDisplay $synopsis $synW }
+
+        $statusColor = switch ($r.Status) {
+            'loaded'   { 'Green' }
+            'archived' { 'DarkGray' }
+            'mixed'    { 'DarkYellow' }
+            default    { 'Gray' }
+        }
+
+        Write-Host ("  {0}  " -f $catPad) -NoNewline
+        Write-Host ("{0}  " -f $scrPad) -NoNewline -ForegroundColor DarkCyan
+        Write-Host ("{0}  " -f $statPad) -NoNewline -ForegroundColor $statusColor
+        Write-Host ("{0}  " -f $cmdPad) -NoNewline -ForegroundColor Cyan
+        Write-Host $synopsis
+    }
+    Write-Host ''
+}
+
 # ─── Get-MyKitCommand ──────────────────────────────────────
 function Get-MyKitCommand {
     <#
@@ -471,6 +649,10 @@ function Get-MyKitCommand {
         Write-Host $r.Synopsis
     }
     Write-Host ''
+    # 无参数时提示用户可使用 Get-MyKitCommandList 查看命令级展开列表
+    if ($Category -eq '' -and $Name -eq '') {
+        Write-Host '提示: 使用 Get-MyKitCommandList 可按命令（函数）逐行列出。' -ForegroundColor DarkGray
+    }
 }
 
 # ─── Import-MyKit ──────────────────────────────────────────
@@ -504,7 +686,8 @@ function Import-MyKit {
             @('Import-MyKit -List -All', '查看全部可导入脚本'),
             @('Import-MyKit -Category git', '导入指定分类'),
             @('Get-MyKitCategory', '查看所有分类'),
-            @('Get-MyKitCommand', '浏览所有命令')
+            @('Get-MyKitCommand', '浏览所有命令'),
+            @('Get-MyKitCommandList', '以命令为中心展开列表')
         )
         foreach ($h in $hints) {
             $padded = __MyKit_PadRight $h[0] $cmdColW
